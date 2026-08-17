@@ -1,0 +1,13 @@
+.gradle/
+build/
+*.log
+.idea/
+*.iml
+.vscode/
+.DS_Store
+*.key
+*.pem
+*.p12
+.env
+*.bak*
+*.uitemplate
