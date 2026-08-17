@@ -182,6 +182,57 @@ class LinkExtractorNetworkListenerUnitTest {
     }
 
     @Test
+    void shouldNotMatchSubdomainsWithLeadingOrTrailingHyphens() {
+        Set<String> candidates =
+                LinkExtractorNetworkListener.extractCandidates(
+                        "-api.example.com api-.example.com -cdn.example.com lib-.cdn.example.com",
+                        false);
+
+        assertFalse(candidates.contains("//-api.example.com"));
+        assertFalse(candidates.contains("//api-.example.com"));
+        assertFalse(candidates.contains("//-cdn.example.com"));
+        assertFalse(candidates.contains("//lib-.cdn.example.com"));
+    }
+
+    @Test
+    void shouldStillMatchHyphenatedButValidSubdomains() {
+        Set<String> candidates =
+                LinkExtractorNetworkListener.extractCandidates(
+                        "use api-test.example.com and staging-2.api.example.com", false);
+
+        assertTrue(candidates.contains("//api-test.example.com"));
+        assertTrue(candidates.contains("//staging-2.api.example.com"));
+    }
+
+    @Test
+    void shouldMatchDeeplyNestedSubdomains() {
+        Set<String> candidates =
+                LinkExtractorNetworkListener.extractCandidates(
+                        "a.b.c.d.e.f.g.h.i.j.k.l.example.com and //one.two.three.four.five.six.example.com/api",
+                        false);
+
+        assertTrue(candidates.contains("//a.b.c.d.e.f.g.h.i.j.k.l.example.com"));
+        assertTrue(candidates.contains("//one.two.three.four.five.six.example.com/api"));
+    }
+
+    @Test
+    void shouldRejectInvalidHostnames() {
+        assertFalse(LinkExtractorNetworkListener.isValidHostname("-api.example.com"));
+        assertFalse(LinkExtractorNetworkListener.isValidHostname("api-.example.com"));
+        assertFalse(LinkExtractorNetworkListener.isValidHostname("a..b.example.com"));
+        assertFalse(LinkExtractorNetworkListener.isValidHostname("-foo.bar.example.com"));
+        assertFalse(LinkExtractorNetworkListener.isValidHostname("foo-.bar.example.com"));
+        assertFalse(LinkExtractorNetworkListener.isValidHostname(""));
+        assertFalse(LinkExtractorNetworkListener.isValidHostname("exa mple.com"));
+
+        assertTrue(LinkExtractorNetworkListener.isValidHostname("api.example.com"));
+        assertTrue(LinkExtractorNetworkListener.isValidHostname("api-test.example.com"));
+        assertTrue(LinkExtractorNetworkListener.isValidHostname("staging-2.api.example.com"));
+        assertTrue(LinkExtractorNetworkListener.isValidHostname("localhost"));
+        assertTrue(LinkExtractorNetworkListener.isValidHostname("1.2.3.4"));
+    }
+
+    @Test
     void shouldExtractBareDomainsAndFilterJunkDomains() {
         Set<String> candidates =
                 LinkExtractorNetworkListener.extractCandidates(
