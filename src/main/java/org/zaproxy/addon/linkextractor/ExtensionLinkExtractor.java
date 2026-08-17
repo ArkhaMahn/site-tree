@@ -3,6 +3,8 @@ package org.zaproxy.addon.linkextractor;
 import org.parosproxy.paros.Constant;
 import org.parosproxy.paros.extension.ExtensionAdaptor;
 import org.parosproxy.paros.extension.ExtensionHook;
+import org.parosproxy.paros.model.SiteMapEventPublisher;
+import org.zaproxy.zap.ZAP;
 
 /**
  * Registers the {@link LinkExtractorNetworkListener} with ZAP's network layer so that Burp-style
@@ -21,6 +23,7 @@ public class ExtensionLinkExtractor extends ExtensionAdaptor {
 
     private LinkExtractorOptionsParam optionsParam;
     private LinkExtractorOptionsPanel optionsPanel;
+    private LinkExtractorNetworkListener networkListener;
 
     public ExtensionLinkExtractor() {
         super(NAME);
@@ -42,12 +45,30 @@ public class ExtensionLinkExtractor extends ExtensionAdaptor {
         // thread for every response ZAP handles (proxied browsing, spider, AJAX spider, active
         // scan, manual requests), before the message is saved to history. This gives the tree
         // population the same priority as the visited message itself.
-        extensionHook.addHttpSenderListener(new LinkExtractorNetworkListener(optionsParam));
+        networkListener = new LinkExtractorNetworkListener(optionsParam);
+        extensionHook.addHttpSenderListener(networkListener);
+
+        // React to site-tree deletions: when nodes are removed (including "delete all nodes" or the
+        // "Refresh Sites tree" context action) the add-on's per-session dedup set must be reset, or
+        // a later visit to the same domain would skip re-adding the deleted URLs.
+        ZAP.getEventBus()
+                .registerConsumer(
+                        networkListener,
+                        SiteMapEventPublisher.getPublisher().getPublisherName(),
+                        SiteMapEventPublisher.SITE_NODE_REMOVED_EVENT,
+                        SiteMapEventPublisher.SITE_REMOVED_EVENT);
     }
 
     @Override
     public boolean canUnload() {
         return true;
+    }
+
+    @Override
+    public void unload() {
+        if (networkListener != null) {
+            ZAP.getEventBus().unregisterConsumer(networkListener);
+        }
     }
 
     @Override
