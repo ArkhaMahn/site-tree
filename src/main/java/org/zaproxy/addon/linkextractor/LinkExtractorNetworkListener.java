@@ -30,12 +30,15 @@ import org.parosproxy.paros.model.HistoryReference;
 import org.parosproxy.paros.model.Model;
 import org.parosproxy.paros.model.Session;
 import org.parosproxy.paros.model.SiteMap;
+import org.parosproxy.paros.model.SiteMapEventPublisher;
 import org.parosproxy.paros.model.SiteNode;
 import org.parosproxy.paros.network.HttpHeader;
 import org.parosproxy.paros.network.HttpMessage;
 import org.parosproxy.paros.network.HttpRequestHeader;
 import org.parosproxy.paros.network.HttpSender;
 import org.parosproxy.paros.view.View;
+import org.zaproxy.zap.eventBus.Event;
+import org.zaproxy.zap.eventBus.EventConsumer;
 import org.zaproxy.zap.network.HttpSenderListener;
 
 /**
@@ -67,14 +70,16 @@ import org.zaproxy.zap.network.HttpSenderListener;
  * <ul>
  *   <li>Only cheap gate checks (empty body, content type, source scope) and a body-byte snapshot
  *       run on the network thread; the (potentially expensive) body decoding, parsing and insertion
- *       happen on a small daemon thread pool. If the pool is saturated the parse is dropped rather
- *       than run inline.
+ *       happen on a single daemon worker thread. If the pool is saturated the parse is dropped
+ *       rather than run inline.
  *   <li>A per-session dedup set avoids re-processing URLs that have already been inserted, so
  *       repeated traffic (e.g. an active scan hitting the same endpoints) does not spam the tree.
+ *       The set is reset whenever site-tree nodes are removed (e.g. the user deletes nodes or
+ *       refreshes the tree), so a deleted node is re-discovered on the next visit.
  *   <li>Every code path is wrapped in {@code try/catch(Throwable)}.
  * </ul>
  */
-public class LinkExtractorNetworkListener implements HttpSenderListener {
+public class LinkExtractorNetworkListener implements HttpSenderListener, EventConsumer {
 
     private static final Logger LOGGER = LogManager.getLogger(LinkExtractorNetworkListener.class);
 
@@ -208,8 +213,9 @@ public class LinkExtractorNetworkListener implements HttpSenderListener {
         this.options = options;
     }
 
-    // Small daemon pool; default AbortPolicy on purpose - a saturated queue DROPS the parse rather
-    // than running it inline on the network/proxy thread.
+    // Single daemon worker (the add-on is passive, so one thread keeps the CPU/memory footprint
+    // minimal); default AbortPolicy on purpose - a saturated queue DROPS the parse rather than
+    // running it inline on the network/proxy thread.
     private static final ExecutorService POOL = createPool();
 
     private static ExecutorService createPool() {
@@ -222,11 +228,11 @@ public class LinkExtractorNetworkListener implements HttpSenderListener {
                 };
         ThreadPoolExecutor pool =
                 new ThreadPoolExecutor(
-                        2,
-                        2,
+                        1,
+                        1,
                         30,
                         TimeUnit.SECONDS,
-                        new LinkedBlockingQueue<>(1000),
+                        new LinkedBlockingQueue<>(100),
                         threadFactory);
         pool.allowCoreThreadTimeOut(true);
         return pool;
@@ -406,6 +412,47 @@ public class LinkExtractorNetworkListener implements HttpSenderListener {
         } catch (RejectedExecutionException e) {
             // Pool saturated: drop the parse. Never run it inline on the network thread.
         }
+    }
+
+    /**
+     * Invoked (synchronously) when a site-tree node or whole site is removed - e.g. the user
+     * deletes nodes from the Sites tree or the tree is refreshed. The per-session dedup set is
+     * reset so a later visit to the same domain re-discovers the deleted URLs; the {@code findNode}
+     * guard in {@link #processResponse} keeps nodes that are still present from being duplicated.
+     *
+     * @param event the site-tree change event.
+     */
+    @Override
+    public void eventReceived(Event event) {
+        if (event == null) {
+            return;
+        }
+        String eventType = event.getEventType();
+        if (!SiteMapEventPublisher.SITE_NODE_REMOVED_EVENT.equals(eventType)
+                && !SiteMapEventPublisher.SITE_REMOVED_EVENT.equals(eventType)) {
+            return;
+        }
+        resetSeen();
+    }
+
+    /**
+     * Clears the per-session dedup set so already-processed URLs can be re-discovered.
+     *
+     * <p>Only ever invoked when the user removes nodes from the Sites tree (or the tree is
+     * refreshed); normal traffic never clears the set, so the fast-path dedup stays effective.
+     */
+    static void resetSeen() {
+        SEEN.clear();
+    }
+
+    /** Package-private test hook: records {@code url} as already processed. */
+    static void markSeen(String url) {
+        SEEN.add(url);
+    }
+
+    /** Package-private test hook: whether {@code url} is currently in the dedup set. */
+    static boolean isSeen(String url) {
+        return SEEN.contains(url);
     }
 
     private void processResponse(
