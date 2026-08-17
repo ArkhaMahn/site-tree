@@ -5,8 +5,56 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Set;
 import org.junit.jupiter.api.Test;
+import org.parosproxy.paros.model.SiteMapEventPublisher;
+import org.zaproxy.zap.eventBus.Event;
+import org.zaproxy.zap.model.Target;
 
 class LinkExtractorNetworkListenerUnitTest {
+
+    @Test
+    void shouldResetDeduplicationWhenSiteNodeRemoved() {
+        LinkExtractorNetworkListener.markSeen("http://example.com/admin");
+        assertTrue(LinkExtractorNetworkListener.isSeen("http://example.com/admin"));
+
+        LinkExtractorNetworkListener listener = new LinkExtractorNetworkListener(null);
+        listener.eventReceived(
+                new Event(
+                        SiteMapEventPublisher.getPublisher(),
+                        SiteMapEventPublisher.SITE_NODE_REMOVED_EVENT,
+                        new Target()));
+
+        assertFalse(LinkExtractorNetworkListener.isSeen("http://example.com/admin"));
+    }
+
+    @Test
+    void shouldResetDeduplicationWhenWholeSiteRemoved() {
+        LinkExtractorNetworkListener.markSeen("http://example.com/admin");
+        assertTrue(LinkExtractorNetworkListener.isSeen("http://example.com/admin"));
+
+        LinkExtractorNetworkListener listener = new LinkExtractorNetworkListener(null);
+        listener.eventReceived(
+                new Event(
+                        SiteMapEventPublisher.getPublisher(),
+                        SiteMapEventPublisher.SITE_REMOVED_EVENT,
+                        new Target()));
+
+        assertFalse(LinkExtractorNetworkListener.isSeen("http://example.com/admin"));
+    }
+
+    @Test
+    void shouldNotResetDeduplicationForUnrelatedEvents() {
+        LinkExtractorNetworkListener.markSeen("http://example.com/admin");
+        assertTrue(LinkExtractorNetworkListener.isSeen("http://example.com/admin"));
+
+        LinkExtractorNetworkListener listener = new LinkExtractorNetworkListener(null);
+        listener.eventReceived(
+                new Event(
+                        SiteMapEventPublisher.getPublisher(),
+                        SiteMapEventPublisher.SITE_NODE_ADDED_EVENT,
+                        new Target()));
+
+        assertTrue(LinkExtractorNetworkListener.isSeen("http://example.com/admin"));
+    }
 
     @Test
     void shouldExtractLinksFromHtmlAttributes() {
