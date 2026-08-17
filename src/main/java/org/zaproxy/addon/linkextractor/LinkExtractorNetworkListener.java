@@ -189,13 +189,24 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         {"&nbsp;", " "},
     };
 
-    // Matches bare "host.label.tld" strings (up to 5 subdomain labels + optional path). The
+    // A single hostname label: starts and ends with an alphanumeric (or non-ASCII letter/digit) and
+    // may only contain hyphens/underscores inside. This rejects labels that begin or end with '-'
+    // (e.g. "-api" or "api-"), which are not valid DNS hostnames.
+    private static final String HOST_LABEL =
+            "[a-zA-Z0-9\\u0080-\\uFFFF](?:[a-zA-Z0-9\\u0080-\\uFFFF_-]*[a-zA-Z0-9\\u0080-\\uFFFF])?";
+
+    // Matches bare "host.label.tld" strings (any number of subdomain labels + optional path). The
     // negative lookbehind avoids re-matching inside "scheme://host" or after a path separator where
     // the bare-http/protocol-relative patterns already own the find. Candidates are validated
-    // against ALLOWED_TLDS by validateDomainCandidate().
+    // against ALLOWED_TLDS by validateDomainCandidate(); per-label hostname syntax is enforced by
+    // isValidHostname(). Depth is unbounded so deeply nested subdomains are never truncated away.
     private static final Pattern DOMAIN_URL =
             Pattern.compile(
-                    "(?<![\\w.:/])(?:[a-zA-Z0-9%\\u0080-\\uFFFF_-]+\\.){0,5}[a-zA-Z0-9%\\u0080-\\uFFFF_-]+\\.[a-zA-Z]{2,24}(?:/[^\\s\"'<>()\\[\\]{}]{0,500})?");
+                    "(?<![\\w.:/])(?:"
+                            + HOST_LABEL
+                            + "\\.)*"
+                            + HOST_LABEL
+                            + "\\.[a-zA-Z]{2,24}(?:/[^\\s\"'<>()\\[\\]{}]{0,500})?");
 
     private static final List<Pattern> HTML_PATTERNS = buildHtmlPatterns();
 
@@ -255,7 +266,13 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         // Bare absolute http(s) URLs and protocol-relative URLs appearing anywhere in the body
         // (not just inside an attribute).
         patterns.add(Pattern.compile("\\bhttps?://[^\\s\"'<>)]+", Pattern.CASE_INSENSITIVE));
-        patterns.add(Pattern.compile("(?:[\"'(]|^|\\s)(//[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}[^\\s\"'<>)]*)"));
+        patterns.add(
+                Pattern.compile(
+                        "(?:[\"'(]|^|\\s)(//"
+                                + HOST_LABEL
+                                + "(?:\\."
+                                + HOST_LABEL
+                                + ")*\\.[a-zA-Z]{2,}[^\\s\"'<>)]*)"));
 
         // Source map references in the body ("//# sourceMappingURL=app.js.map"); the response
         // header form is handled separately in onHttpResponseReceive.
@@ -526,6 +543,12 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                     }
                 } catch (Exception e) {
                     discoveredHost = null;
+                }
+
+                // Reject candidates whose resolved host is not a valid hostname (e.g. labels that
+                // start or end with '-'), so invalid "subdomains" never reach the Sites tree.
+                if (discoveredHost != null && !isValidHostname(discoveredHost)) {
+                    continue;
                 }
 
                 // Filter well-known third-party/framework noise by resolved host + path (relative
@@ -830,6 +853,11 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         if (slash != -1) {
             hostPart = key.substring(0, slash);
         }
+        // Every label must be a syntactically valid hostname label (no leading/trailing '-',
+        // no empty/oversized labels), otherwise candidates like "-api.example.com" are rejected.
+        if (!isValidHostname(hostPart)) {
+            return null;
+        }
         String[] labels = hostPart.split("\\.");
         if (labels.length < 2) {
             return null;
@@ -862,6 +890,63 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
             return null;
         }
         return "//" + key;
+    }
+
+    /**
+     * Whether {@code host} is a syntactically valid hostname: every dot-separated label must be
+     * 1-63 chars, composed of letters/digits/inner hyphens, and must not start or end with a hyphen
+     * or underscore. Accepts single-label hosts ({@code localhost}) and dotted-quad IPs.
+     *
+     * @param host the host to validate, may be {@code null}.
+     * @return {@code true} if the host is well-formed.
+     */
+    static boolean isValidHostname(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+        String h = host.endsWith(".") ? host.substring(0, host.length() - 1) : host;
+        if (h.length() > 253) {
+            return false;
+        }
+        String[] labels = h.split("\\.", -1);
+        if (labels.length == 0) {
+            return false;
+        }
+        for (String label : labels) {
+            if (!isValidHostLabel(label)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Whether {@code label} is a valid hostname label: 1-63 chars of letters/digits/inner hyphens
+     * (inner underscores tolerated), not starting or ending with a hyphen or underscore.
+     *
+     * @param label the label to validate, never {@code null}.
+     * @return {@code true} if the label is well-formed.
+     */
+    private static boolean isValidHostLabel(String label) {
+        if (label.isEmpty() || label.length() > 63) {
+            return false;
+        }
+        char first = label.charAt(0);
+        char last = label.charAt(label.length() - 1);
+        if (first == '-' || last == '-' || first == '_' || last == '_') {
+            return false;
+        }
+        for (int i = 0; i < label.length(); i++) {
+            char c = label.charAt(i);
+            if (!((c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9')
+                    || c == '-'
+                    || c == '_')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
