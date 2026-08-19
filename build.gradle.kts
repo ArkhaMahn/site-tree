@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "org.zaproxy.addon"
-version = "1.0.0"
+version = "1.1.0"
 description =
     "Network-layer Burp-style link extraction: runs inline on every response ZAP receives and, for " +
         "in-scope sources, adds URLs discovered in HTML/JS/CSS/JSON/XML bodies to the Sites tree as " +
