@@ -6,7 +6,6 @@
 
 <p>
 <a href="LICENSE"><img src="https://img.shields.io/github/license/ArkhaMahn/site-tree?color=5B3AB6&label=license" alt="license"></a>
-<a href="https://github.com/ArkhaMahn/site-tree/actions"><img src="https://img.shields.io/github/actions/workflow/status/ArkhaMahn/site-tree/build.yml?branch=master&label=build" alt="build"></a>
 <a href="https://github.com/ArkhaMahn/site-tree/issues"><img src="https://img.shields.io/badge/PRs-welcome-5B3AB6" alt="PRs welcome"></a>
 </p>
 
@@ -49,7 +48,7 @@ The ZAP add-on artifact is produced at:
 
 ## Install in ZAP
 
-1. Build the `.zap` (above), or download it from the latest [GitHub Actions build](../../actions).
+1. Build the `.zap` (above).
 2. In ZAP: **File → Load Add-on File…** and select the built `.zap`, OR drop the `.zap` into ZAP's `plugin` directory and restart.
 3. The add-on runs automatically on in-scope traffic — no further configuration needed.
 
@@ -77,4 +76,4 @@ Original idea and implementation credit goes to [xnl-h4ck3r](https://github.com/
 
 ## License
 
-[Apache-2.0](LICENSE) © 2024 Arkhamahn
+[Apache-2.0](LICENSE) © 2026 Arkhamahn
