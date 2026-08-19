@@ -1,45 +1,80 @@
-Site tree
-=========
+<div align="center">
 
-A ZAP 2.17.0 add-on that performs network-layer Burp-style link extraction: it
-runs inline on every response ZAP receives and, for in-scope sources, adds URLs
-discovered in HTML/JS/CSS/JSON/XML bodies to the Sites tree as unrequested
-(`TYPE_ZAP_USER`) entries, without sending any requests to them.
+# Site Tree
 
-It is inspired by [`xnLinkFinder`](https://github.com/xnl-h4ck3r/xnLinkFinder).
+### A ZAP 2.17.0 add-on for network-layer passive link extraction — inspired by [xnLinkFinder](https://github.com/xnl-h4ck3r/xnLinkFinder).
 
-Author: Arkhamahn. Original idea and implementation credit goes to
-[`xnl-h4ck3r`](https://github.com/xnl-h4ck3r) and the `xnLinkFinder` project.
+<p>
+<a href="LICENSE"><img src="https://img.shields.io/github/license/ArkhaMahn/site-tree?color=5B3AB6&label=license" alt="license"></a>
+<a href="https://github.com/ArkhaMahn/site-tree/actions"><img src="https://img.shields.io/github/actions/workflow/status/ArkhaMahn/site-tree/build.yml?branch=master&label=build" alt="build"></a>
+<a href="https://github.com/ArkhaMahn/site-tree/issues"><img src="https://img.shields.io/badge/PRs-welcome-5B3AB6" alt="PRs welcome"></a>
+</p>
 
-Vibecoded with love 🖤
+</div>
 
-## How it works
+---
 
-Every in-scope response ZAP receives (proxied browsing, spider, AJAX spider,
-active scan) is inspected the moment it arrives. All URLs and
-endpoint-looking string literals in HTML/JS/CSS/JSON/XML bodies are resolved
-and added to the Sites tree as unrequested (`TYPE_ZAP_USER`) entries with an
-empty response and a "Discovered via passive link extraction - NOT requested"
-note.
+# Site Tree — ZAP add-on
 
-No request is ever sent to the discovered URLs. Cross-host candidates are
-added as new subdomain folder nodes flagged with a "[NEW SUBDOMAIN]" note.
+A [ZAP](https://www.zaproxy.org/) add-on that performs **network-layer passive link extraction** on every in-scope response. It discovers URLs in HTML, JavaScript, CSS, JSON, and XML bodies and adds them to the Sites tree as unrequested (`TYPE_ZAP_USER`) entries — without sending any requests to them.
 
-Because it hooks the network layer (`HttpSenderListener`) and runs inline on
-the request/proxy thread, the tree populates immediately when a domain is
-visited, with no dependency on the passive scan queue.
+Inspired by the [xnLinkFinder](https://github.com/xnl-h4ck3r/xnLinkFinder) project.
 
-Both JavaScript parsing and subdomain discovery can be toggled under
-`Tools > Options > Sites tree`.
+> **Status: alpha.** Built and verified for ZAP 2.17.0. The extension loads cleanly with no errors. Please report any issues.
 
-## Building
+---
 
-Requires JDK 17+ and Gradle 8.13+.
+## What it does
 
-```
+- Hooks the network layer (`HttpSenderListener`) and runs inline on every in-scope response (proxied browsing, spider, AJAX spider, active scan).
+- Extracts URLs and endpoint-looking string literals from HTML/JS/CSS/JSON/XML bodies.
+- Adds discovered URLs to the Sites tree as unrequested entries with an empty response and a "Discovered via passive link extraction - NOT requested" note.
+- **No requests are ever sent** to discovered URLs.
+- Cross-host candidates are added as new subdomain folder nodes flagged with a "[NEW SUBDOMAIN]" note.
+- Tree populates immediately when a domain is visited — no dependency on the passive scan queue.
+- JavaScript parsing and subdomain discovery can be toggled under `Tools > Options > Sites tree`.
+
+---
+
+## Build
+
+Requires JDK 17+ and [Gradle](https://gradle.org/install/) 8.13+:
+
+```sh
 gradle build
 ```
 
-The ZAP add-on artifact is produced at
-`build/zapAddOn/bin/site-tree-alpha-1.0.0.zap`. Install it in ZAP via
-`Manage Add-ons -> Install...`.
+The ZAP add-on artifact is produced at:
+`build/zapAddOn/bin/site-tree-alpha-1.1.0.zap`
+
+## Install in ZAP
+
+1. Build the `.zap` (above), or download it from the latest [GitHub Actions build](../../actions).
+2. In ZAP: **File → Load Add-on File…** and select the built `.zap`, OR drop the `.zap` into ZAP's `plugin` directory and restart.
+3. The add-on runs automatically on in-scope traffic — no further configuration needed.
+
+---
+
+## Development
+
+```
+src/main/java/org/zaproxy/addon/linkextractor/
+  ExtensionLinkExtractor.java       # ExtensionAdaptor entry point
+  LinkExtractorNetworkListener.java # HttpSenderListener — inline response processing
+  LinkExtractorOptionsPanel.java    # Options UI (Tools > Options > Sites tree)
+  LinkExtractorOptionsParam.java    # Options persistence
+```
+
+The extraction runs on the request/proxy thread (inline with response processing) for immediate tree updates.
+
+---
+
+## Credits
+
+Original idea and implementation credit goes to [xnl-h4ck3r](https://github.com/xnl-h4ck3r) and the [xnLinkFinder](https://github.com/xnl-h4ck3r/xnLinkFinder) project.
+
+---
+
+## License
+
+[Apache-2.0](LICENSE) © 2024 Arkhamahn
