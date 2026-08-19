@@ -11,12 +11,18 @@ import org.zaproxy.zap.model.Target;
 
 class LinkExtractorNetworkListenerUnitTest {
 
+    private static LinkExtractorOptionsParam createOptions() {
+        LinkExtractorOptionsParam options = new LinkExtractorOptionsParam();
+        // Don't call parseImpl() as it reads from config; just use defaults
+        return options;
+    }
+
     @Test
     void shouldResetDeduplicationWhenSiteNodeRemoved() {
         LinkExtractorNetworkListener.markSeen("http://example.com/admin");
         assertTrue(LinkExtractorNetworkListener.isSeen("http://example.com/admin"));
 
-        LinkExtractorNetworkListener listener = new LinkExtractorNetworkListener(null);
+        LinkExtractorNetworkListener listener = new LinkExtractorNetworkListener(createOptions());
         listener.eventReceived(
                 new Event(
                         SiteMapEventPublisher.getPublisher(),
@@ -31,7 +37,7 @@ class LinkExtractorNetworkListenerUnitTest {
         LinkExtractorNetworkListener.markSeen("http://example.com/admin");
         assertTrue(LinkExtractorNetworkListener.isSeen("http://example.com/admin"));
 
-        LinkExtractorNetworkListener listener = new LinkExtractorNetworkListener(null);
+        LinkExtractorNetworkListener listener = new LinkExtractorNetworkListener(createOptions());
         listener.eventReceived(
                 new Event(
                         SiteMapEventPublisher.getPublisher(),
@@ -46,7 +52,7 @@ class LinkExtractorNetworkListenerUnitTest {
         LinkExtractorNetworkListener.markSeen("http://example.com/admin");
         assertTrue(LinkExtractorNetworkListener.isSeen("http://example.com/admin"));
 
-        LinkExtractorNetworkListener listener = new LinkExtractorNetworkListener(null);
+        LinkExtractorNetworkListener listener = new LinkExtractorNetworkListener(createOptions());
         listener.eventReceived(
                 new Event(
                         SiteMapEventPublisher.getPublisher(),
