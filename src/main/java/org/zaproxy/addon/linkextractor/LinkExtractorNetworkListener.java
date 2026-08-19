@@ -219,17 +219,16 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     private static long currentSessionId = -1L;
 
     private final LinkExtractorOptionsParam options;
+    private final ExecutorService pool;
 
     public LinkExtractorNetworkListener(LinkExtractorOptionsParam options) {
         this.options = options;
+        this.pool = createPool(options.getThreads());
     }
 
-    // Single daemon worker (the add-on is passive, so one thread keeps the CPU/memory footprint
-    // minimal); default AbortPolicy on purpose - a saturated queue DROPS the parse rather than
-    // running it inline on the network/proxy thread.
-    private static final ExecutorService POOL = createPool();
-
-    private static ExecutorService createPool() {
+    // Daemon worker pool (the add-on is passive); default AbortPolicy on purpose - a saturated
+    // queue DROPS the parse rather than running it inline on the network/proxy thread.
+    private ExecutorService createPool(int threads) {
         AtomicInteger counter = new AtomicInteger();
         ThreadFactory threadFactory =
                 r -> {
@@ -239,8 +238,8 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                 };
         ThreadPoolExecutor pool =
                 new ThreadPoolExecutor(
-                        1,
-                        1,
+                        threads,
+                        threads,
                         30,
                         TimeUnit.SECONDS,
                         new LinkedBlockingQueue<>(100),
@@ -423,9 +422,9 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         }
     }
 
-    private static void submit(Runnable task) {
+    private void submit(Runnable task) {
         try {
-            POOL.execute(task);
+            pool.execute(task);
         } catch (RejectedExecutionException e) {
             // Pool saturated: drop the parse. Never run it inline on the network thread.
         }
