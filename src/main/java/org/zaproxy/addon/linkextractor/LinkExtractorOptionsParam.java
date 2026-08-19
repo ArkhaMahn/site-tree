@@ -28,11 +28,16 @@ public class LinkExtractorOptionsParam extends VersionedAbstractParam {
 
     private static final String PARSE_JAVASCRIPT_KEY = BASE_KEY + ".parseJavascript";
     private static final String DISCOVER_SUBDOMAINS_KEY = BASE_KEY + ".discoverSubdomains";
+    private static final String THREADS_KEY = BASE_KEY + ".threads";
 
-    private static final int CURRENT_VERSION = 1;
+    private static final int CURRENT_VERSION = 2;
+    private static final int DEFAULT_THREADS = 2;
+    public static final int MIN_THREADS = 2;
+    public static final int MAX_THREADS = 8;
 
     private volatile boolean parseJavascript = true;
     private volatile boolean discoverSubdomains = true;
+    private volatile int threads = DEFAULT_THREADS;
 
     public boolean isParseJavascript() {
         return parseJavascript;
@@ -52,6 +57,15 @@ public class LinkExtractorOptionsParam extends VersionedAbstractParam {
         getConfig().setProperty(DISCOVER_SUBDOMAINS_KEY, discoverSubdomains);
     }
 
+    public int getThreads() {
+        return threads;
+    }
+
+    public void setThreads(int threads) {
+        this.threads = Math.max(MIN_THREADS, Math.min(MAX_THREADS, threads));
+        getConfig().setProperty(THREADS_KEY, this.threads);
+    }
+
     @Override
     protected void parseImpl() {
         try {
@@ -64,6 +78,13 @@ public class LinkExtractorOptionsParam extends VersionedAbstractParam {
             discoverSubdomains = getBoolean(DISCOVER_SUBDOMAINS_KEY, true);
         } catch (ConversionException e) {
             LOGGER.error("Failed to read option {}", DISCOVER_SUBDOMAINS_KEY, e);
+        }
+
+        try {
+            int t = getInt(THREADS_KEY, DEFAULT_THREADS);
+            threads = Math.max(MIN_THREADS, t);
+        } catch (ConversionException e) {
+            LOGGER.error("Failed to read option {}", THREADS_KEY, e);
         }
     }
 
