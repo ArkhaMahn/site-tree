@@ -6,13 +6,10 @@ runs inline on every response ZAP receives and, for in-scope sources, adds URLs
 discovered in HTML/JS/CSS/JSON/XML bodies to the Sites tree as unrequested
 (`TYPE_ZAP_USER`) entries, without sending any requests to them.
 
-It is inspired by the Burp-style passive link extraction script
-`burp_style_passive_link_extraction.js` and by
-[`xnLinkFinder`](https://github.com/xnl-h4ck3r/xnLinkFinder).
+It is inspired by [`xnLinkFinder`](https://github.com/xnl-h4ck3r/xnLinkFinder).
 
 Author: Arkhamahn. Original idea and implementation credit goes to
-[`xnl-h4ck3r`](https://github.com/xnl-h4ck3r), the `burp_style_passive_link_extraction.js`
-script and the `xnLinkFinder` project.
+[`xnl-h4ck3r`](https://github.com/xnl-h4ck3r) and the `xnLinkFinder` project.
 
 Vibecoded with love 🖤
 
