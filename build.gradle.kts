@@ -5,7 +5,7 @@ plugins {
     id("org.zaproxy.add-on") version "0.13.1"
 }
 
-group = "org.zaproxy.addon"
+group = "Arkhamahn"
 version = "1.1.0"
 description =
     "Network-layer Burp-style link extraction: runs inline on every response ZAP receives and, for " +
@@ -37,7 +37,7 @@ zapAddOn {
         author.set("Arkhamahn")
         url.set("https://github.com/ArkhaMahn/site-tree")
         bundle {
-            baseName.set("org.zaproxy.addon.linkextractor.resources.Messages")
+            baseName.set("Arkhamahn.linkextractor.resources.Messages")
             prefix.set("linkextractor")
         }
     }

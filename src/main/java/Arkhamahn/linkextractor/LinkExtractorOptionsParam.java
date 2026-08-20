@@ -1,4 +1,4 @@
-package org.zaproxy.addon.linkextractor;
+package Arkhamahn.linkextractor;
 
 import org.apache.commons.configuration.ConversionException;
 import org.apache.logging.log4j.LogManager;

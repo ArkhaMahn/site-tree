@@ -1,4 +1,4 @@
-package org.zaproxy.addon.linkextractor;
+package Arkhamahn.linkextractor;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;

@@ -1,4 +1,4 @@
-package org.zaproxy.addon.linkextractor;
+package Arkhamahn.linkextractor;
 
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;

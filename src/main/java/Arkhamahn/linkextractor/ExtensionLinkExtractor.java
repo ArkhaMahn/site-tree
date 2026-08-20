@@ -1,4 +1,4 @@
-package org.zaproxy.addon.linkextractor;
+package Arkhamahn.linkextractor;
 
 import org.parosproxy.paros.Constant;
 import org.parosproxy.paros.extension.ExtensionAdaptor;
