@@ -188,9 +188,6 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     private static final ScheduledExecutorService TOKEN_REFILL = 
             createTokenRefillExecutor();
 
-    // Maximum response body size to process (bytes) - skip huge responses
-    private static final int MAX_RESPONSE_SIZE = 500_000; // 500KB
-
     // Large responses are searched in overlapping chunks to keep regex work bounded (xnLinkFinder
     // uses the same threshold/sizes).
     private static final int CHUNK_THRESHOLD = 50000;
@@ -402,14 +399,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                 return;
             }
 
-            // Skip huge responses to avoid excessive processing
-            if (msg.getResponseBody().length() > MAX_RESPONSE_SIZE) {
-                if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("LinkExtractor: skipping large response ({} bytes)",
-                            msg.getResponseBody().length());
-                }
-                return;
-            }
+            
 
             // Only bother parsing response types that could plausibly contain links.
             String contentType = msg.getResponseHeader().getHeader(HttpHeader.CONTENT_TYPE);
