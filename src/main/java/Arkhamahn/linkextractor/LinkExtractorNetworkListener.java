@@ -11,14 +11,20 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Queue;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -171,6 +177,20 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     private static final Pattern MIMETYPE_PREFIX =
             Pattern.compile("^(?:application|image|model|video|audio|text)/", Pattern.CASE_INSENSITIVE);
 
+    // Batch EDT updates to prevent UI freezing
+    private static final Queue<Runnable> EDT_BATCH = new ConcurrentLinkedQueue<>();
+    private static final AtomicBoolean EDT_FLUSH_SCHEDULED = new AtomicBoolean(false);
+    private static final int BATCH_FLUSH_MS = 100;
+
+    // Rate limiting for tree insertions (token bucket)
+    private static final AtomicInteger INSERT_TOKENS = new AtomicInteger(50);
+    private static final int MAX_INSERT_TOKENS = 50;
+    private static final ScheduledExecutorService TOKEN_REFILL = 
+            createTokenRefillExecutor();
+
+    // Maximum response body size to process (bytes) - skip huge responses
+    private static final int MAX_RESPONSE_SIZE = 500_000; // 500KB
+
     // Large responses are searched in overlapping chunks to keep regex work bounded (xnLinkFinder
     // uses the same threshold/sizes).
     private static final int CHUNK_THRESHOLD = 50000;
@@ -246,6 +266,33 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                         threadFactory);
         pool.allowCoreThreadTimeOut(true);
         return pool;
+    }
+
+    private static ScheduledExecutorService createTokenRefillExecutor() {
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "ZAP-LinkExtractor-TokenRefill");
+            t.setDaemon(true);
+            return t;
+        });
+        executor.scheduleAtFixedRate(() -> 
+            INSERT_TOKENS.updateAndGet(v -> Math.min(MAX_INSERT_TOKENS, v + 10)), 0, 100, TimeUnit.MILLISECONDS);
+        return executor;
+    }
+
+    private static boolean tryAcquireInsertToken() {
+        return INSERT_TOKENS.updateAndGet(v -> v > 0 ? v - 1 : 0) >= 0;
+    }
+
+    private static void scheduleEdtFlush() {
+        if (EDT_FLUSH_SCHEDULED.compareAndSet(false, true)) {
+            EventQueue.invokeLater(() -> {
+                EDT_FLUSH_SCHEDULED.set(false);
+                Runnable task;
+                while ((task = EDT_BATCH.poll()) != null) {
+                    task.run();
+                }
+            });
+        }
     }
 
     private static List<Pattern> buildHtmlPatterns() {
@@ -352,6 +399,15 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                 return;
             }
             if (msg.getResponseBody().length() == 0) {
+                return;
+            }
+
+            // Skip huge responses to avoid excessive processing
+            if (msg.getResponseBody().length() > MAX_RESPONSE_SIZE) {
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("LinkExtractor: skipping large response ({} bytes)",
+                            msg.getResponseBody().length());
+                }
                 return;
             }
 
@@ -1078,59 +1134,65 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                     note);
         }
 
+        // Rate limit tree insertions to prevent UI freezing
+        if (!tryAcquireInsertToken()) {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("LinkExtractor: rate limited, skipping {}", uri);
+            }
+            return;
+        }
+
         // SiteMap.addPath(HistoryReference, HttpMessage) is NOT synchronized (only addPath(ref) is),
         // so a caller inserting at the same moment as the proxy's own addToSiteMap can race its host
         // creation and end up with two sibling host nodes. The proxy always adds the real message,
         // so for same-host candidates we first wait for that host node to appear before inserting;
         // insertNode then serialises all our own inserts so we never race ourselves either.
         if (!isNewSubdomain) {
-            waitForHost(siteTree, baseUrlStr);
+            waitForHost(siteTree, baseUrlStr).join();
         }
-        insertNode(siteTree, hr, newMsg);
+        insertNodeBatched(siteTree, hr, newMsg);
     }
 
     /**
-     * Blocks the current thread until the base host of {@code hostUrl} is present in the tree, or a
+     * Waits asynchronously until the base host of {@code hostUrl} is present in the tree, or a
      * bounded timeout elapses. The proxy inserts the real (in-scope) message right after the
      * response, so for same-host candidates this guarantees ZAP's host node exists before we add
      * ours, closing the addPath race window.
      *
      * @param siteTree the site tree.
      * @param hostUrl the base URL whose host node should appear.
-     * @return {@code true} if the host appeared in time, {@code false} if the timeout elapsed.
+     * @return a CompletableFuture that completes with {@code true} if the host appeared in time,
+     *         {@code false} if the timeout elapsed.
      */
-    private static boolean waitForHost(SiteMap siteTree, String hostUrl) {
+    private static CompletableFuture<Boolean> waitForHost(SiteMap siteTree, String hostUrl) {
+        CompletableFuture<Boolean> future = new CompletableFuture<>();
         try {
             URI hostUri = new URI(hostUrl, false);
-            long deadline = System.currentTimeMillis() + 1500L;
-            while (System.currentTimeMillis() < deadline) {
-                if (siteTree.findNode(hostUri) != null) {
-                    return true;
+            new Thread(() -> {
+                long deadline = System.currentTimeMillis() + 1500L;
+                while (System.currentTimeMillis() < deadline) {
+                    if (siteTree.findNode(hostUri) != null) {
+                        future.complete(true);
+                        return;
+                    }
+                    try { Thread.sleep(50); } catch (InterruptedException e) { break; }
                 }
-                try {
-                    Thread.sleep(20);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
-            }
-            return false;
+                future.complete(false);
+            }, "ZAP-LinkExtractor-WaitForHost").start();
         } catch (Exception e) {
-            return false;
+            future.complete(false);
         }
+        return future;
     }
 
     /**
      * Serialises all our tree insertions (SiteMap.addPath(HistoryReference, HttpMessage) is not
      * synchronized, so our own concurrent worker threads could otherwise race each other), then runs
-     * the mutation on the Swing EDT when a view is present.
+     * the mutation on the Swing EDT using batched updates to prevent UI freezing.
      */
-    private static synchronized void insertNode(SiteMap siteTree, HistoryReference hr, HttpMessage msg) {
-        if (!View.isInitialised() || EventQueue.isDispatchThread()) {
-            addPath(siteTree, hr, msg);
-        } else {
-            EventQueue.invokeLater(() -> addPath(siteTree, hr, msg));
-        }
+    private static synchronized void insertNodeBatched(SiteMap siteTree, HistoryReference hr, HttpMessage msg) {
+        EDT_BATCH.offer(() -> addPath(siteTree, hr, msg));
+        scheduleEdtFlush();
     }
 
     private static void addPath(SiteMap siteTree, HistoryReference hr, HttpMessage msg) {
