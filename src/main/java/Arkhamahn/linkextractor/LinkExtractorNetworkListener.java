@@ -6,15 +6,17 @@ import java.nio.charset.Charset;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -97,6 +99,10 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     private static final String NOTE_NEW_SUBDOMAIN_PREFIX = "[NEW SUBDOMAIN] ";
 
     private static final int MAX_SEEN = 50000;
+
+    // Upper bound on placeholder nodes created from a single response, so one crafted page cannot
+    // flood the session database with history rows.
+    private static final int MAX_INSERTS_PER_RESPONSE = 200;
 
     private static final Pattern TEMPLATE_LITERAL = Pattern.compile("`([^`]*\\$\\{[^`]*\\}[^`]*)`");
 
@@ -216,12 +222,18 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     // negative lookbehind avoids re-matching inside "scheme://host" or after a path separator where
     // the bare-http/protocol-relative patterns already own the find. Candidates are validated
     // against ALLOWED_TLDS by validateDomainCandidate(); per-label hostname syntax is enforced by
-    // isValidHostname(). Depth is unbounded so deeply nested subdomains are never truncated away.
+    // isValidHostname(). Label repetitions are bounded: an unbounded quantifier here lets deeply
+    // chained labels (about a thousand, only a few KB of body) recurse the regex engine until its
+    // stack overflows, so the depth is capped at a level well beyond real-world subdomains.
+    private static final int MAX_DOMAIN_LABELS = 24;
+
     private static final Pattern DOMAIN_URL =
             Pattern.compile(
                     "(?<![\\w.:/])(?:"
                             + HOST_LABEL
-                            + "\\.)*"
+                            + "\\.){0,"
+                            + MAX_DOMAIN_LABELS
+                            + "}"
                             + HOST_LABEL
                             + "\\.[a-zA-Z]{2,24}(?:/[^\\s\"'<>()\\[\\]{}]{0,500})?");
 
@@ -231,8 +243,22 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     // Sites tree.
     private static final List<Pattern> JS_PATTERNS = buildJsPatterns();
 
-    // URLs already inserted for the current session (dedup across network threads).
-    private static final Set<String> SEEN = ConcurrentHashMap.newKeySet();
+    // URLs already inserted for the current session (dedup across network threads). A bounded
+    // FIFO set: when the cap is reached the OLDEST entries are evicted, so an attacker cannot
+    // force a wholesale reset (and re-injection of previously seen URLs) by flooding new URLs.
+    private static final Set<String> SEEN =
+            Collections.synchronizedSet(
+                    Collections.newSetFromMap(
+                            new LinkedHashMap<String, Boolean>(1024, 0.75f, false) {
+
+                                private static final long serialVersionUID = 1L;
+
+                                @Override
+                                protected boolean removeEldestEntry(
+                                        Map.Entry<String, Boolean> eldest) {
+                                    return size() > MAX_SEEN;
+                                }
+                            }));
     private static long currentSessionId = -1L;
 
     private final LinkExtractorOptionsParam options;
@@ -315,7 +341,9 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                                 + HOST_LABEL
                                 + "(?:\\."
                                 + HOST_LABEL
-                                + ")*\\.[a-zA-Z]{2,}[^\\s\"'<>)]*)"));
+                                + "){0,"
+                                + MAX_DOMAIN_LABELS
+                                + "}\\.[a-zA-Z]{2,}[^\\s\"'<>)]*)"));
 
         // Source map references in the body ("//# sourceMappingURL=app.js.map"); the response
         // header form is handled separately in onHttpResponseReceive.
@@ -554,7 +582,15 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
 
             SiteMap siteTree = session.getSiteTree();
 
+            int inserted = 0;
             for (String raw : found) {
+                if (inserted >= MAX_INSERTS_PER_RESPONSE) {
+                    LOGGER.info(
+                            "LinkExtractor: per-response insert cap ({}) reached for {}",
+                            MAX_INSERTS_PER_RESPONSE,
+                            baseUrlStr);
+                    break;
+                }
                 // Bare "//host/path" protocol-relative URLs need the scheme from the base page
                 // prefixed before java.net.URL will accept them.
                 String resolved;
@@ -657,6 +693,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                             isNewSubdomain ? "(new subdomain)" : "");
                 }
                 addPlaceholderNode(session, siteTree, targetUri, isNewSubdomain, baseUrlStr);
+                inserted++;
             }
         } catch (Throwable t) {
             LOGGER.warn("LinkExtractor: processResponse error for {}", baseUrlStr, t);
@@ -664,19 +701,17 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     }
 
     /**
-     * Resets the dedup set when a new session is loaded or when it grows beyond the cap.
+     * Resets the dedup set when a new session is loaded. Size-based eviction is handled by the
+     * bounded FIFO set itself (oldest entries are dropped first), so a flood of new URLs can never
+     * force a wholesale reset.
      *
      * @param session the current session.
      */
     private static void dedupe(Session session) {
         long sessionId = session.getSessionId();
-        synchronized (SEEN) {
-            if (currentSessionId != sessionId) {
-                currentSessionId = sessionId;
-                SEEN.clear();
-            } else if (SEEN.size() > MAX_SEEN) {
-                SEEN.clear();
-            }
+        if (currentSessionId != sessionId) {
+            currentSessionId = sessionId;
+            SEEN.clear();
         }
     }
 
@@ -1090,6 +1125,16 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
 
     private static void addPlaceholderNode(
             Session session, SiteMap siteTree, URI uri, boolean isNewSubdomain, String baseUrlStr) {
+        // Rate limit tree insertions BEFORE anything is persisted: creating the HistoryReference
+        // writes a row to the session database, so without this gate a crafted page full of unique
+        // URLs could flood the database regardless of how fast the UI can keep up.
+        if (!tryAcquireInsertToken()) {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("LinkExtractor: rate limited, skipping {}", uri);
+            }
+            return;
+        }
+
         // Build the synthetic message + HistoryReference on the worker thread (the HistoryReference
         // constructor persists the message to the DB), then mutate the Sites tree on the Swing EDT
         // as required by SiteMap.
@@ -1122,14 +1167,6 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                     hr.getHistoryId(),
                     uri,
                     note);
-        }
-
-        // Rate limit tree insertions to prevent UI freezing
-        if (!tryAcquireInsertToken()) {
-            if (LOGGER.isDebugEnabled()) {
-                LOGGER.debug("LinkExtractor: rate limited, skipping {}", uri);
-            }
-            return;
         }
 
         // SiteMap.addPath(HistoryReference, HttpMessage) is NOT synchronized (only addPath(ref) is),
