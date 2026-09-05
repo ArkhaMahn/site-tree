@@ -41,6 +41,7 @@ import org.parosproxy.paros.model.SiteMap;
 import org.parosproxy.paros.model.SiteMapEventPublisher;
 import org.parosproxy.paros.model.SiteNode;
 import org.parosproxy.paros.network.HttpHeader;
+import org.parosproxy.paros.network.HttpHeaderField;
 import org.parosproxy.paros.network.HttpMessage;
 import org.parosproxy.paros.network.HttpRequestHeader;
 import org.parosproxy.paros.network.HttpSender;
@@ -50,13 +51,13 @@ import org.zaproxy.zap.eventBus.EventConsumer;
 import org.zaproxy.zap.network.HttpSenderListener;
 
 /**
- * Network-layer Burp-style link extraction for the Sites tree.
+ * Network-layer Burp-style link extraction for the Site tree.
  *
  * <p>Hooks the network layer via {@link HttpSenderListener} so that every response ZAP receives
  * (proxied browsing, spider, AJAX spider, active scan, manual requests) is inspected the moment it
  * arrives - on the request/proxy thread, before the message is saved to history - with no dependency
  * on the passive scan queue or any scan rule priority. If the source URL is in the session scope,
- * the add-on fires immediately and populates the Sites tree.
+ * the add-on fires immediately and populates the Site tree.
  *
  * <p>Ported from {@code burp_style_passive_link_extraction.js} (a ZAP Scripts "Passive Rules" script)
  * into a compiled add-on that runs at the network level. Link discovery (patterns, candidate
@@ -158,7 +159,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                             "child", "global", "element", "div", "prototype", "event", "feature",
                             "path"));
 
-    // Well-known third-party / framework hosts and paths that add no value to the Sites tree
+    // Well-known third-party / framework hosts and paths that add no value to the Site tree
     // (curated from xnLinkFinder's DEFAULT_LINK_EXCLUSIONS; asset-path tokens are omitted so
     // genuine same-site resources like /css/ and /img/ still become tree nodes).
     private static final List<String> JUNK_TOKENS =
@@ -240,8 +241,60 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     private static final List<Pattern> HTML_PATTERNS = buildHtmlPatterns();
 
     // JS-specific patterns; gated behind the "Parse JavaScript" option in Tools > Options >
-    // Sites tree.
+    // Site tree.
     private static final List<Pattern> JS_PATTERNS = buildJsPatterns();
+
+    // Matches a host token inside a response-header value, allowing an optional wildcard prefix
+    // ("cdn.example.com", "*.example.com") and an optional leading dot (Set-Cookie "Domain=.example.com").
+    // The wildcard/leading dot is consumed before group 2, which holds the base host directly
+    // ("*.example.com" and ".example.com" both yield "example.com"). Label repetition is bounded the
+    // same way as DOMAIN_URL to keep the matcher bounded.
+    private static final Pattern HEADER_HOST_PATTERN =
+            Pattern.compile(
+                    "(?<![a-zA-Z0-9_.-])"
+                            + "(?:(\\*)?\\.)?"
+                            + "((?:(?:"
+                            + HOST_LABEL
+                            + "\\.){0,"
+                            + MAX_DOMAIN_LABELS
+                            + "})"
+                            + HOST_LABEL
+                            + "\\.[a-zA-Z]{2,24})"
+                            + "(?![a-zA-Z0-9_.-])");
+
+    // Response headers whose values are structurally never useful subdomains (lengths, dates,
+    // encodings, transport directives, ...). Everything else - CSP, Link, Location,
+    // Set-Cookie, Access-Control-*, Server, Vendor "X-*" headers, ... - is scanned for hosts.
+    private static final Set<String> SKIP_HOST_HEADERS =
+            new HashSet<>(
+                    Arrays.asList(
+                            "connection",
+                            "keep-alive",
+                            "transfer-encoding",
+                            "content-length",
+                            "content-type",
+                            "content-encoding",
+                            "content-language",
+                            "content-disposition",
+                            "cache-control",
+                            "pragma",
+                            "expires",
+                            "date",
+                            "age",
+                            "last-modified",
+                            "etag",
+                            "vary",
+                            "accept-ranges",
+                            "retry-after",
+                            "www-authenticate",
+                            "proxy-authenticate",
+                            "allow",
+                            "strict-transport-security",
+                            "x-xss-protection",
+                            "x-content-type-options",
+                            "x-frame-options",
+                            "x-request-id",
+                            "x-zap-scan-id"));
 
     // URLs already inserted for the current session (dedup across network threads). A bounded
     // FIFO set: when the cap is reached the OLDEST entries are evicted, so an attacker cannot
@@ -489,6 +542,16 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                 }
             }
 
+            // Subdomain discovery from response headers (Tools > Options > Site tree): scan every
+            // header value for host tokens (honouring wildcards like "*.example.com") and treat
+            // them like cross-host candidates so they become new subdomain folder nodes.
+            if (options.isDiscoverSubdomainsFromHeaders()) {
+                List<HttpHeaderField> headerFields = msg.getResponseHeader().getHeaders();
+                if (headerFields != null) {
+                    extraCandidates.addAll(extractHeaderHosts(headerFields));
+                }
+            }
+
             submit(() -> processResponse(baseUrlStr, bodySnapshot, charset, extraCandidates));
         } catch (Throwable t) {
             // A network-layer hook must never disturb the request/response flow.
@@ -506,7 +569,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
 
     /**
      * Invoked (synchronously) when a site-tree node or whole site is removed - e.g. the user
-     * deletes nodes from the Sites tree or the tree is refreshed. The per-session dedup set is
+     * deletes nodes from the Site tree or the tree is refreshed. The per-session dedup set is
      * reset so a later visit to the same domain re-discovers the deleted URLs; the {@code findNode}
      * guard in {@link #processResponse} keeps nodes that are still present from being duplicated.
      *
@@ -528,7 +591,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     /**
      * Clears the per-session dedup set so already-processed URLs can be re-discovered.
      *
-     * <p>Only ever invoked when the user removes nodes from the Sites tree (or the tree is
+     * <p>Only ever invoked when the user removes nodes from the Site tree (or the tree is
      * refreshed); normal traffic never clears the set, so the fast-path dedup stays effective.
      */
     static void resetSeen() {
@@ -627,7 +690,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                 }
 
                 // Reject candidates whose resolved host is not a valid hostname (e.g. labels that
-                // start or end with '-'), so invalid "subdomains" never reach the Sites tree.
+                // start or end with '-'), so invalid "subdomains" never reach the Site tree.
                 if (discoveredHost != null && !isValidHostname(discoveredHost)) {
                     continue;
                 }
@@ -645,7 +708,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                                 && baseHost != null
                                 && !discoveredHost.equals(baseHost);
 
-                // Subdomain discovery toggle (Tools > Options > Sites tree): with it off, only
+                // Subdomain discovery toggle (Tools > Options > Site tree): with it off, only
                 // same-host candidates are added.
                 if (!options.isDiscoverSubdomains() && isNewSubdomain) {
                     continue;
@@ -1044,6 +1107,49 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         return decoded;
     }
 
+    /**
+     * Scans HTTP response-header fields for host tokens and returns them prefixed with {@code //}
+     * (so they resolve like protocol-relative URLs against the base URL).
+     *
+     * <p>A wildcard-prefixed entry ({@code *.example.com}) resolves to its base domain
+     * ({@code example.com}), which is what a wildcard denotes: that domain and every host under it.
+     *
+     * <p>Headers whose values are structurally never useful (lengths, dates, encodings, transport
+     * directives - see {@link #SKIP_HOST_HEADERS}) are not scanned. Candidates are validated with
+     * {@link #isValidHostname} before being returned.
+     *
+     * @param headers the response-header fields, may be {@code null}.
+     * @return the discovered hosts as {@code //host} strings, never {@code null}.
+     */
+    static Set<String> extractHeaderHosts(List<HttpHeaderField> headers) {
+        Set<String> hosts = new LinkedHashSet<>();
+        if (headers == null) {
+            return hosts;
+        }
+        for (HttpHeaderField field : headers) {
+            if (field == null) {
+                continue;
+            }
+            String name = field.getName();
+            String value = field.getValue();
+            if (name == null || value == null) {
+                continue;
+            }
+            if (SKIP_HOST_HEADERS.contains(name.toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            Matcher m = HEADER_HOST_PATTERN.matcher(value);
+            while (m.find()) {
+                String host = m.group(2);
+                if (host == null || !isValidHostname(host)) {
+                    continue;
+                }
+                hosts.add("//" + host);
+            }
+        }
+        return hosts;
+    }
+
     private static void addCandidate(Set<String> found, String raw) {
         if (raw == null) {
             return;
@@ -1136,7 +1242,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         }
 
         // Build the synthetic message + HistoryReference on the worker thread (the HistoryReference
-        // constructor persists the message to the DB), then mutate the Sites tree on the Swing EDT
+        // constructor persists the message to the DB), then mutate the Site tree on the Swing EDT
         // as required by SiteMap.
         final HttpMessage newMsg = new HttpMessage();
         final HistoryReference hr;
