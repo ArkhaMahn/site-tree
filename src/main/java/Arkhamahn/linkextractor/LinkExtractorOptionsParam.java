@@ -8,13 +8,16 @@ import org.zaproxy.zap.common.VersionedAbstractParam;
 /**
  * Options for the {@link LinkExtractorNetworkListener}.
  *
- * <p>Two toggles are exposed under <em>Tools &gt; Options &gt; Sites tree</em>:
+ * <p>Three toggles are exposed under <em>Tools &gt; Options &gt; Site tree</em>:
  *
  * <ul>
  *   <li>{@link #isParseJavascript()} - whether JS-specific extraction patterns (fetch/axios/XHR/
  *       template literals, bare API path literals, ...) are run against response bodies.
  *   <li>{@link #isDiscoverSubdomains()} - whether cross-host links discovered on an in-scope page
- *       are added to the Sites tree as new (folder) subdomain nodes.
+ *       are added to the Site tree as new (folder) subdomain nodes.
+ *   <li>{@link #isDiscoverSubdomainsFromHeaders()} - whether hostnames found in HTTP response
+ *       headers (e.g. CSP, Link, Set-Cookie, Content-Location) are added as new subdomain nodes,
+ *       honouring wildcard entries such as {@code *.example.com}.
  * </ul>
  *
  * <p>The fields are {@code volatile} because they are written on the Swing EDT (options panel) and
@@ -28,6 +31,8 @@ public class LinkExtractorOptionsParam extends VersionedAbstractParam {
 
     private static final String PARSE_JAVASCRIPT_KEY = BASE_KEY + ".parseJavascript";
     private static final String DISCOVER_SUBDOMAINS_KEY = BASE_KEY + ".discoverSubdomains";
+    private static final String DISCOVER_SUBDOMAINS_HEADERS_KEY =
+            BASE_KEY + ".discoverSubdomainsFromHeaders";
     private static final String THREADS_KEY = BASE_KEY + ".threads";
 
     private static final int CURRENT_VERSION = 2;
@@ -37,6 +42,7 @@ public class LinkExtractorOptionsParam extends VersionedAbstractParam {
 
     private volatile boolean parseJavascript = true;
     private volatile boolean discoverSubdomains = true;
+    private volatile boolean discoverSubdomainsFromHeaders = true;
     private volatile int threads = DEFAULT_THREADS;
 
     public boolean isParseJavascript() {
@@ -55,6 +61,15 @@ public class LinkExtractorOptionsParam extends VersionedAbstractParam {
     public void setDiscoverSubdomains(boolean discoverSubdomains) {
         this.discoverSubdomains = discoverSubdomains;
         getConfig().setProperty(DISCOVER_SUBDOMAINS_KEY, discoverSubdomains);
+    }
+
+    public boolean isDiscoverSubdomainsFromHeaders() {
+        return discoverSubdomainsFromHeaders;
+    }
+
+    public void setDiscoverSubdomainsFromHeaders(boolean discoverSubdomainsFromHeaders) {
+        this.discoverSubdomainsFromHeaders = discoverSubdomainsFromHeaders;
+        getConfig().setProperty(DISCOVER_SUBDOMAINS_HEADERS_KEY, discoverSubdomainsFromHeaders);
     }
 
     public int getThreads() {
@@ -78,6 +93,12 @@ public class LinkExtractorOptionsParam extends VersionedAbstractParam {
             discoverSubdomains = getBoolean(DISCOVER_SUBDOMAINS_KEY, true);
         } catch (ConversionException e) {
             LOGGER.error("Failed to read option {}", DISCOVER_SUBDOMAINS_KEY, e);
+        }
+
+        try {
+            discoverSubdomainsFromHeaders = getBoolean(DISCOVER_SUBDOMAINS_HEADERS_KEY, true);
+        } catch (ConversionException e) {
+            LOGGER.error("Failed to read option {}", DISCOVER_SUBDOMAINS_HEADERS_KEY, e);
         }
 
         try {
