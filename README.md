@@ -15,7 +15,7 @@
 
 # Site Tree — ZAP add-on
 
-A [ZAP](https://www.zaproxy.org/) add-on that performs **network-layer passive link extraction** on every in-scope response. It discovers URLs in HTML, JavaScript, CSS, JSON, and XML bodies and adds them to the Sites tree as unrequested (`TYPE_ZAP_USER`) entries — without sending any requests to them.
+A [ZAP](https://www.zaproxy.org/) add-on that performs **network-layer passive link extraction** on every in-scope response. It discovers URLs in HTML, JavaScript, CSS, JSON, and XML bodies and adds them to the Site tree as unrequested (`TYPE_ZAP_USER`) entries — without sending any requests to them.
 
 Inspired by the [xnLinkFinder](https://github.com/xnl-h4ck3r/xnLinkFinder) project.
 
@@ -27,11 +27,12 @@ Inspired by the [xnLinkFinder](https://github.com/xnl-h4ck3r/xnLinkFinder) proje
 
 - Hooks the network layer (`HttpSenderListener`) and runs inline on every in-scope response (proxied browsing, spider, AJAX spider, active scan).
 - Extracts URLs and endpoint-looking string literals from HTML/JS/CSS/JSON/XML bodies.
-- Adds discovered URLs to the Sites tree as unrequested entries with an empty response and a "Discovered via passive link extraction - NOT requested" note.
+- Adds discovered URLs to the Site tree as unrequested entries with an empty response and a "Discovered via passive link extraction - NOT requested" note.
 - **No requests are ever sent** to discovered URLs.
 - Cross-host candidates are added as new subdomain folder nodes flagged with a "[NEW SUBDOMAIN]" note.
+- Hostnames found in HTTP response headers (CSP, Link, Set-Cookie, Location, ...) are added as new subdomain folder nodes; wildcard entries such as `*.example.com` are resolved to the apex domain.
 - Tree populates immediately when a domain is visited — no dependency on the passive scan queue.
-- JavaScript parsing and subdomain discovery can be toggled under `Tools > Options > Sites tree`.
+- JavaScript parsing, subdomain discovery from body links, and subdomain discovery from HTTP response headers (wildcards such as `*.example.com` supported) can each be toggled under `Tools > Options > Site tree`.
 
 ---
 
@@ -44,7 +45,7 @@ gradle build
 ```
 
 The ZAP add-on artifact is produced at:
-`build/zapAddOn/bin/site-tree-alpha-1.1.0.zap`
+`build/zapAddOn/bin/site-tree-alpha-1.2.0.zap`
 
 ## Install in ZAP
 
@@ -60,7 +61,7 @@ The ZAP add-on artifact is produced at:
 src/main/java/org/zaproxy/addon/linkextractor/
   ExtensionLinkExtractor.java       # ExtensionAdaptor entry point
   LinkExtractorNetworkListener.java # HttpSenderListener — inline response processing
-  LinkExtractorOptionsPanel.java    # Options UI (Tools > Options > Sites tree)
+  LinkExtractorOptionsPanel.java    # Options UI (Tools > Options > Site tree)
   LinkExtractorOptionsParam.java    # Options persistence
 ```
 
