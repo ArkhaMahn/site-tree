@@ -10,7 +10,7 @@ import org.zaproxy.zap.ZAP;
  * Registers the {@link LinkExtractorNetworkListener} with ZAP's network layer so that Burp-style
  * link extraction runs synchronously on every response ZAP receives - the moment an in-scope domain
  * is visited - instead of on the (lower-priority) passive scan queue. No UI is added; the add-on
- * only enhances the Sites tree.
+ * only enhances the Site tree.
  *
  * <p>Ported from the Burp-style passive link extraction script
  * {@code burp_style_passive_link_extraction.js}.
@@ -34,8 +34,9 @@ public class ExtensionLinkExtractor extends ExtensionAdaptor {
     public void hook(ExtensionHook extensionHook) {
         super.hook(extensionHook);
 
-        // Options (Tools > Options > "Sites tree"): JavaScript parsing and subdomain discovery can
-        // be switched off independently.
+        // Options (Tools > Options > "Site tree"): JavaScript parsing, subdomain discovery from
+        // body links, and subdomain discovery from HTTP response headers can be switched on or
+        // off independently.
         optionsParam = new LinkExtractorOptionsParam();
         optionsPanel = new LinkExtractorOptionsPanel(optionsParam);
         extensionHook.addOptionsParamSet(optionsParam);
@@ -49,7 +50,7 @@ public class ExtensionLinkExtractor extends ExtensionAdaptor {
         extensionHook.addHttpSenderListener(networkListener);
 
         // React to site-tree deletions: when nodes are removed (including "delete all nodes" or the
-        // "Refresh Sites tree" context action) the add-on's per-session dedup set must be reset, or
+        // "Refresh Site tree" context action) the add-on's per-session dedup set must be reset, or
         // a later visit to the same domain would skip re-adding the deleted URLs.
         ZAP.getEventBus()
                 .registerConsumer(
