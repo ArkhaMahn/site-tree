@@ -6,10 +6,10 @@ plugins {
 }
 
 group = "Arkhamahn"
-version = "1.1.0"
+version = "1.2.0"
 description =
     "Network-layer Burp-style link extraction: runs inline on every response ZAP receives and, for " +
-        "in-scope sources, adds URLs discovered in HTML/JS/CSS/JSON/XML bodies to the Sites tree as " +
+        "in-scope sources, adds URLs discovered in HTML/JS/CSS/JSON/XML bodies to the Site tree as " +
         "unrequested (TYPE_ZAP_USER) entries, without sending any requests to them."
 
 repositories {
