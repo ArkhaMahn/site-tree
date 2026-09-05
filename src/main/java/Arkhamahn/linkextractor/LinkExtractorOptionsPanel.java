@@ -13,10 +13,11 @@ import org.parosproxy.paros.view.AbstractParamPanel;
 import org.zaproxy.zap.utils.ZapHtmlLabel;
 
 /**
- * Options panel shown under <em>Tools > Options > Sites tree</em>.
+ * Options panel shown under <em>Tools > Options > Site tree</em>.
  *
  * <p>Provides toggles for the optional behaviours of the {@link LinkExtractorNetworkListener}:
- * JavaScript parsing, subdomain discovery, and thread concurrency.
+ * JavaScript parsing, subdomain discovery (body links and response headers), and thread
+ * concurrency.
  */
 public class LinkExtractorOptionsPanel extends AbstractParamPanel {
 
@@ -28,6 +29,7 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
 
     private JCheckBox parseJavascriptCheckBox;
     private JCheckBox discoverSubdomainsCheckBox;
+    private JCheckBox discoverSubdomainsFromHeadersCheckBox;
     private JSlider threadsSlider;
 
     public LinkExtractorOptionsPanel(LinkExtractorOptionsParam optionsParam) {
@@ -58,10 +60,13 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
         add(getDiscoverSubdomainsCheckBox(), gbc);
 
         gbc.gridy = 3;
+        add(getDiscoverSubdomainsFromHeadersCheckBox(), gbc);
+
+        gbc.gridy = 4;
         gbc.insets = new Insets(8, 0, 0, 0);
         add(getThreadsPanel(), gbc);
 
-        gbc.gridy = 4;
+        gbc.gridy = 5;
         gbc.weighty = 1.0;
         gbc.fill = GridBagConstraints.BOTH;
         gbc.insets = new Insets(0, 0, 0, 0);
@@ -81,6 +86,16 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
                     new JCheckBox(Constant.messages.getString(PREFIX + ".label.discoverSubdomains"));
         }
         return discoverSubdomainsCheckBox;
+    }
+
+    private JCheckBox getDiscoverSubdomainsFromHeadersCheckBox() {
+        if (discoverSubdomainsFromHeadersCheckBox == null) {
+            discoverSubdomainsFromHeadersCheckBox =
+                    new JCheckBox(
+                            Constant.messages.getString(
+                                    PREFIX + ".label.discoverSubdomainsFromHeaders"));
+        }
+        return discoverSubdomainsFromHeadersCheckBox;
     }
 
     private JPanel getThreadsPanel() {
@@ -123,6 +138,8 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
         LinkExtractorOptionsParam param = optionsParam.getParamSet(LinkExtractorOptionsParam.class);
         getParseJavascriptCheckBox().setSelected(param.isParseJavascript());
         getDiscoverSubdomainsCheckBox().setSelected(param.isDiscoverSubdomains());
+        getDiscoverSubdomainsFromHeadersCheckBox()
+                .setSelected(param.isDiscoverSubdomainsFromHeaders());
         threadsSlider.setValue(param.getThreads());
     }
 
@@ -132,6 +149,8 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
         LinkExtractorOptionsParam param = optionsParam.getParamSet(LinkExtractorOptionsParam.class);
         param.setParseJavascript(getParseJavascriptCheckBox().isSelected());
         param.setDiscoverSubdomains(getDiscoverSubdomainsCheckBox().isSelected());
+        param.setDiscoverSubdomainsFromHeaders(
+                getDiscoverSubdomainsFromHeadersCheckBox().isSelected());
         param.setThreads(threadsSlider.getValue());
     }
 }
