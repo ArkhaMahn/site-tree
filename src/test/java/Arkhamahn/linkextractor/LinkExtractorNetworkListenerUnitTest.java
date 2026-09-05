@@ -3,9 +3,12 @@ package Arkhamahn.linkextractor;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.Arrays;
+import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.parosproxy.paros.model.SiteMapEventPublisher;
+import org.parosproxy.paros.network.HttpHeaderField;
 import org.zaproxy.zap.eventBus.Event;
 import org.zaproxy.zap.model.Target;
 
@@ -266,5 +269,81 @@ class LinkExtractorNetworkListenerUnitTest {
         assertFalse(disabled.contains("/api/v2/items"));
         assertFalse(disabled.contains("api/v2/export.json"));
         assertFalse(disabled.contains("config.json"));
+    }
+
+    @Test
+    void shouldExtractHostsFromResponseHeaders() {
+        List<HttpHeaderField> headers =
+                Arrays.asList(
+                        new HttpHeaderField("Link", "<https://cdn.example.com/lib.js>; rel=preload"),
+                        new HttpHeaderField(
+                                "Content-Security-Policy",
+                                "default-src 'self' api.example.com *.assets.example.com"),
+                        new HttpHeaderField("Set-Cookie", "session=abc; Domain=.example.com; Path=/"),
+                        new HttpHeaderField("X-Backend-Server", "web01.internal.example.com"));
+
+        Set<String> hosts = LinkExtractorNetworkListener.extractHeaderHosts(headers);
+
+        assertTrue(hosts.contains("//cdn.example.com"));
+        assertTrue(hosts.contains("//api.example.com"));
+        assertTrue(hosts.contains("//assets.example.com"));
+        assertTrue(hosts.contains("//example.com"));
+        assertTrue(hosts.contains("//web01.internal.example.com"));
+    }
+
+    @Test
+    void shouldResolveWildcardHeaderHostsToApexDomain() {
+        List<HttpHeaderField> headers =
+                Arrays.asList(
+                        new HttpHeaderField(
+                                "Content-Security-Policy",
+                                "connect-src *.example.com *.sub.example.com realm.example.com"));
+
+        Set<String> hosts = LinkExtractorNetworkListener.extractHeaderHosts(headers);
+
+        assertTrue(hosts.contains("//example.com"));
+        assertTrue(hosts.contains("//sub.example.com"));
+        assertTrue(hosts.contains("//realm.example.com"));
+    }
+
+    @Test
+    void shouldSkipHeadersThatCannotContainUsefulHosts() {
+        List<HttpHeaderField> headers =
+                Arrays.asList(
+                        new HttpHeaderField("Content-Type", "text/html; charset=utf-8"),
+                        new HttpHeaderField("Content-Length", "123"),
+                        new HttpHeaderField("Content-Encoding", "gzip"),
+                        new HttpHeaderField("Date", "Thu, 05 Sep 2026 06:00:00 GMT"),
+                        new HttpHeaderField("Cache-Control", "no-store, max-age=0"),
+                        new HttpHeaderField("Server", "nginx/1.18.0"),
+                        new HttpHeaderField("X-Content-Type-Options", "nosniff"));
+
+        Set<String> hosts = LinkExtractorNetworkListener.extractHeaderHosts(headers);
+
+        assertTrue(hosts.isEmpty());
+    }
+
+    @Test
+    void shouldSkipInvalidHeaderHostsButKeepValidOnes() {
+        List<HttpHeaderField> headers =
+                Arrays.asList(
+                        new HttpHeaderField("X-Suspect", "bad-.example.com -evil.example.com"),
+                        new HttpHeaderField("X-Good", "good.example.com"));
+
+        Set<String> hosts = LinkExtractorNetworkListener.extractHeaderHosts(headers);
+
+        assertTrue(hosts.contains("//good.example.com"));
+        assertFalse(hosts.contains("//bad-.example.com"));
+        assertFalse(hosts.contains("//-evil.example.com"));
+    }
+
+    @Test
+    void shouldReturnEmptySetForNullOrEmptyHeaders() {
+        assertTrue(LinkExtractorNetworkListener.extractHeaderHosts(null).isEmpty());
+        assertTrue(LinkExtractorNetworkListener.extractHeaderHosts(Arrays.asList()).isEmpty());
+        assertTrue(
+                LinkExtractorNetworkListener.extractHeaderHosts(
+                                Arrays.asList(new HttpHeaderField(null, null)))
+                        .isEmpty());
     }
 }
