@@ -1,6 +1,8 @@
 package Arkhamahn.linkextractor;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Arrays;
@@ -345,5 +347,57 @@ class LinkExtractorNetworkListenerUnitTest {
                 LinkExtractorNetworkListener.extractHeaderHosts(
                                 Arrays.asList(new HttpHeaderField(null, null)))
                         .isEmpty());
+    }
+
+    @Test
+    void shouldComputeRegistrableDomain() {
+        assertEquals("example.com", LinkExtractorNetworkListener.registrableDomain("example.com"));
+        assertEquals(
+                "example.com", LinkExtractorNetworkListener.registrableDomain("www.example.com"));
+        assertEquals(
+                "example.com",
+                LinkExtractorNetworkListener.registrableDomain("api.dev.example.com"));
+        assertEquals(
+                "example.co.uk",
+                LinkExtractorNetworkListener.registrableDomain("www.example.co.uk"));
+        assertEquals("localhost", LinkExtractorNetworkListener.registrableDomain("localhost"));
+        assertNull(LinkExtractorNetworkListener.registrableDomain(null));
+    }
+
+    @Test
+    void shouldConsiderSubdomainsOfSameRegistrableDomainInScope() {
+        assertTrue(
+                LinkExtractorNetworkListener.isSameDomainFamily(
+                        "www.example.com", "api.example.com"));
+        assertTrue(
+                LinkExtractorNetworkListener.isSameDomainFamily(
+                        "example.com", "www.example.com"));
+        assertTrue(
+                LinkExtractorNetworkListener.isSameDomainFamily(
+                        "www.example.com", "example.com"));
+        assertTrue(
+                LinkExtractorNetworkListener.isSameDomainFamily(
+                        "www.example.com", "deep.api.example.com"));
+        assertTrue(
+                LinkExtractorNetworkListener.isSameDomainFamily(
+                        "www.example.co.uk", "api.example.co.uk"));
+        assertTrue(LinkExtractorNetworkListener.isSameDomainFamily("localhost", "api.localhost"));
+    }
+
+    @Test
+    void shouldRejectUnrelatedThirdPartyDomains() {
+        assertFalse(
+                LinkExtractorNetworkListener.isSameDomainFamily(
+                        "example.com", "cdn.stripe.com"));
+        assertFalse(
+                LinkExtractorNetworkListener.isSameDomainFamily(
+                        "www.example.com", "www.google.com"));
+        assertFalse(
+                LinkExtractorNetworkListener.isSameDomainFamily(
+                        "example.co.uk", "evil.co.uk"));
+        assertFalse(
+                LinkExtractorNetworkListener.isSameDomainFamily("example.com", "example.com.evil.io"));
+        assertFalse(LinkExtractorNetworkListener.isSameDomainFamily("example.com", null));
+        assertFalse(LinkExtractorNetworkListener.isSameDomainFamily(null, "api.example.com"));
     }
 }

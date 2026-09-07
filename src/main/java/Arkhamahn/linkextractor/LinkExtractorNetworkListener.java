@@ -147,6 +147,46 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         return tlds;
     }
 
+    // Known compound public suffixes (last-two-label TLDs) used when computing a host's
+    // registrable domain so subdomain discovery stays within the in-scope domain: e.g.
+    // "www.example.co.uk" and "api.example.co.uk" share "example.co.uk" while the unrelated
+    // "evil.co.uk" does not. Curated from the most common multi-label public suffixes.
+    private static final Set<String> COMPOUND_PUBLIC_SUFFIXES =
+            new HashSet<>(
+                    Arrays.asList(
+                            "ac.uk", "co.uk", "gov.uk", "ltd.uk", "me.uk", "net.uk", "nhs.uk",
+                            "org.uk", "plc.uk",
+                            "com.au", "net.au", "org.au", "edu.au", "gov.au", "asn.au", "id.au",
+                            "co.nz", "net.nz", "org.nz", "ac.nz", "govt.nz",
+                            "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "gr.jp",
+                            "com.br", "net.br", "org.br", "gov.br", "edu.br",
+                            "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+                            "co.in", "net.in", "org.in", "gov.in", "edu.in", "ac.in", "res.in",
+                            "com.sg", "org.sg", "net.sg", "edu.sg", "gov.sg",
+                            "co.za", "org.za", "net.za", "gov.za", "edu.za", "ac.za",
+                            "com.mx", "org.mx", "net.mx", "gov.mx", "edu.mx", "gob.mx",
+                            "com.ar", "org.ar", "net.ar", "gov.ar", "edu.ar", "gob.ar",
+                            "com.co", "org.co", "net.co", "gov.co", "edu.co",
+                            "com.tw", "org.tw", "net.tw", "gov.tw", "edu.tw", "idv.tw",
+                            "com.hk", "org.hk", "net.hk", "gov.hk", "edu.hk",
+                            "com.ng", "org.ng", "net.ng", "gov.ng", "edu.ng",
+                            "com.pk", "org.pk", "net.pk", "gov.pk", "edu.pk",
+                            "com.tr", "org.tr", "net.tr", "gov.tr", "edu.tr",
+                            "co.ke", "org.ke", "net.ke", "gov.ke", "edu.ke", "ac.ke",
+                            "com.ua", "org.ua", "net.ua", "gov.ua", "edu.ua",
+                            "com.ph", "org.ph", "net.ph", "gov.ph", "edu.ph",
+                            "com.my", "org.my", "net.my", "gov.my", "edu.my", "sch.my",
+                            "com.vn", "org.vn", "net.vn", "gov.vn", "edu.vn", "ac.vn",
+                            "com.sa", "org.sa", "net.sa", "gov.sa", "edu.sa",
+                            "com.ae", "org.ae", "net.ae", "gov.ae", "edu.ae",
+                            "co.il", "org.il", "net.il", "gov.il", "edu.il", "ac.il",
+                            "com.pl", "org.pl", "net.pl", "gov.pl", "edu.pl",
+                            "co.th", "org.th", "net.th", "gov.th", "edu.th", "ac.th",
+                            "com.ru", "org.ru", "net.ru", "edu.ru",
+                            "com.kr", "org.kr", "net.kr", "gov.kr", "edu.kr", "ac.kr", "go.kr",
+                            "co.id", "or.id", "web.id", "gov.id", "edu.id", "ac.id", "sch.id",
+                            "com.eg", "org.eg", "net.eg", "gov.eg", "edu.eg"));
+
     // Second-level labels that are almost always false positives (from xnLinkFinder).
     private static final Set<String> EXCLUDED_SUFFIXES =
             new HashSet<>(Arrays.asList("call", "skin", "menu", "style", "rest", "next", "top"));
@@ -708,6 +748,17 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                                 && baseHost != null
                                 && !discoveredHost.equals(baseHost);
 
+                // In-scope enforcement: subdomain discovery must only add hosts on in-scope
+                // domains. A cross-host candidate is kept only when its host belongs to the same
+                // domain family as the (in-scope) source host - a subdomain of that registrable
+                // domain - or when the resolved URL is itself explicitly within the session scope
+                // (multi-domain contexts). Unrelated third-party hosts never reach the Site tree.
+                if (isNewSubdomain
+                        && !isSameDomainFamily(baseHost, discoveredHost)
+                        && !session.isInScope(resolved)) {
+                    continue;
+                }
+
                 // Subdomain discovery toggle (Tools > Options > Site tree): with it off, only
                 // same-host candidates are added.
                 if (!options.isDiscoverSubdomains() && isNewSubdomain) {
@@ -1033,6 +1084,54 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
             return null;
         }
         return "//" + key;
+    }
+
+    /**
+     * The registrable (apex) domain of {@code host}: its last two labels, unless it ends in a known
+     * compound public suffix (e.g. {@code co.uk}), in which case the last three. Single-label hosts
+     * ({@code localhost}) return themselves. Case is normalised to lower-case.
+     *
+     * @param host the host to reduce, may be {@code null}.
+     * @return the registrable domain, or {@code null} if the host is invalid or {@code null}.
+     */
+    static String registrableDomain(String host) {
+        if (host == null || host.isEmpty()) {
+            return null;
+        }
+        String h = host.toLowerCase(Locale.ROOT);
+        String[] labels = h.split("\\.");
+        if (labels.length <= 2) {
+            return h;
+        }
+        String lastTwo = labels[labels.length - 2] + "." + labels[labels.length - 1];
+        if (COMPOUND_PUBLIC_SUFFIXES.contains(lastTwo)) {
+            return labels[labels.length - 3] + "." + lastTwo;
+        }
+        return lastTwo;
+    }
+
+    /**
+     * Whether {@code discoveredHost} belongs to the same domain family as {@code baseHost}: it is
+     * the same host, a subdomain of it, or shares its registrable domain (e.g. {@code api.example
+     * .com} and {@code www.example.com} both belong to {@code example.com}). Used to keep subdomain
+     * discovery within the in-scope domain.
+     *
+     * @param baseHost the (in-scope) source host, may be {@code null}.
+     * @param discoveredHost the candidate host, may be {@code null}.
+     * @return {@code true} if the candidate belongs to the base host's domain family.
+     */
+    static boolean isSameDomainFamily(String baseHost, String discoveredHost) {
+        if (baseHost == null || discoveredHost == null) {
+            return false;
+        }
+        String b = baseHost.toLowerCase(Locale.ROOT);
+        String d = discoveredHost.toLowerCase(Locale.ROOT);
+        if (b.equals(d) || d.endsWith("." + b)) {
+            return true;
+        }
+        String bDomain = registrableDomain(b);
+        String dDomain = registrableDomain(d);
+        return bDomain != null && bDomain.equals(dDomain);
     }
 
     /**
