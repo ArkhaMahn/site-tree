@@ -38,10 +38,12 @@ Inspired by the [xnLinkFinder](https://github.com/xnl-h4ck3r/xnLinkFinder) proje
 
 ## Build
 
-Requires JDK 17+. The Gradle wrapper is included — no separate Gradle install needed:
+Requires JDK 17+ and [Gradle](https://gradle.org/install/) 8.13+ (or use the included wrapper):
 
 ```sh
 ./gradlew build
+# or, if Gradle is installed globally:
+gradle build
 ```
 
 The ZAP add-on artifact is produced at:
