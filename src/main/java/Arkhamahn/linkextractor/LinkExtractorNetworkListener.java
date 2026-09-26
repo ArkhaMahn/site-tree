@@ -16,7 +16,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -34,6 +33,8 @@ import java.util.regex.Pattern;
 import org.apache.commons.httpclient.URI;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.parosproxy.paros.control.Control;
+import org.parosproxy.paros.extension.history.ExtensionHistory;
 import org.parosproxy.paros.model.HistoryReference;
 import org.parosproxy.paros.model.Model;
 import org.parosproxy.paros.model.Session;
@@ -45,7 +46,6 @@ import org.parosproxy.paros.network.HttpHeaderField;
 import org.parosproxy.paros.network.HttpMessage;
 import org.parosproxy.paros.network.HttpRequestHeader;
 import org.parosproxy.paros.network.HttpSender;
-import org.parosproxy.paros.view.View;
 import org.zaproxy.zap.eventBus.Event;
 import org.zaproxy.zap.eventBus.EventConsumer;
 import org.zaproxy.zap.network.HttpSenderListener;
@@ -70,21 +70,41 @@ import org.zaproxy.zap.network.HttpSenderListener;
  *   <li>Every candidate URL is resolved against the request's base URL and written to the Sites
  *       tree as a predicted entry - no request is ever sent to it. Cross-host candidates are flagged
  *       with a {@code "[NEW SUBDOMAIN]"} prefix on the note.
- *   <li>Entries are written with {@link HistoryReference#TYPE_ZAP_USER} (distinct icon) and a Note
- *       flagging them as not-yet-requested.
+ *   <li>Every candidate URL needs a {@link HistoryReference} (that is how a Site tree node is
+ *       backed), so the entries are written with a Note flagging them as not-yet-requested. The
+ *       history <em>type</em> of that reference is what decides whether the entry can ever be listed
+ *       in the history tab - see {@link #historyTypeFor(boolean)}.
+ *   <li>With the "record in the history tab" option enabled (Tools &gt; Options &gt; Site tree) the
+ *       entries use {@link HistoryReference#TYPE_ZAP_USER}, so they are listed in the history tab as
+ *       soon as they are discovered. With the option disabled they use
+ *       {@link HistoryReference#TYPE_HIDDEN} instead, which ZAP never lists in the history tab -
+ *       neither when the entry is added nor when the history view is rebuilt (in-scope toggle, the
+ *       history filter, or a session reload). They still show up in the Site tree and are still
+ *       saved with the session.
  *   <li>Scope is delegated entirely to ZAP's own session/context scope engine.
  * </ul>
  *
  * <p>Safety (a network-layer hook must never disturb the request/response flow):
  * <ul>
- *   <li>Only cheap gate checks (empty body, content type, source scope) and a body-byte snapshot
- *       run on the network thread; the (potentially expensive) body decoding, parsing and insertion
- *       happen on a single daemon worker thread. If the pool is saturated the parse is dropped
- *       rather than run inline.
+ *   <li>Only cheap gate checks run on the network thread - body size, empty body, content type,
+ *       source scope, and the parse-queue depth - plus a body-byte snapshot of a body that has
+ *       already passed the size gate. The (potentially expensive) body decoding, parsing and
+ *       insertion happen on a small pool of daemon worker threads; a response that arrives while the
+ *       pool or its queue is saturated is dropped rather than queued or run inline.
+ *   <li>Responses larger than the configured scan limit (default 5 MB, see {@link
+ *       LinkExtractorOptionsParam#getMaxBodySizeMb()}) are not scanned at all, so neither the
+ *       snapshot on the network thread nor the decode on the worker can be made arbitrarily large.
+ *   <li>Every extraction pattern has bounded quantifiers, so a crafted page cannot turn a pattern
+ *       into quadratic scanning work on a worker thread.
+ *   <li>Insertions are rate limited by a token bucket that is checked <em>before</em> anything is
+ *       persisted, each response is capped, and per-response work is bounded (one short host-node
+ *       wait, a capped number of EDT tasks per flush), so a single response can neither flood the
+ *       session database nor pin a worker thread.
  *   <li>A per-session dedup set avoids re-processing URLs that have already been inserted, so
  *       repeated traffic (e.g. an active scan hitting the same endpoints) does not spam the tree.
  *       The set is reset whenever site-tree nodes are removed (e.g. the user deletes nodes or
  *       refreshes the tree), so a deleted node is re-discovered on the next visit.
+ *   <li>All threads, the pool and the pending task queue are released in {@link #shutdown()}.
  *   <li>Every code path is wrapped in {@code try/catch(Throwable)}.
  * </ul>
  */
@@ -99,6 +119,28 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     private static final String NOTE_BODY = "Discovered via passive link extraction - NOT requested";
     private static final String NOTE_NEW_SUBDOMAIN_PREFIX = "[NEW SUBDOMAIN] ";
 
+    /**
+     * History type for a discovered entry when it is to be listed in the history tab.
+     *
+     * <p>{@link HistoryReference#TYPE_ZAP_USER} is one of the three types ZAP's history tab queries
+     * ({@code {TYPE_MANUAL/TYPE_PROXIED, TYPE_ZAP_USER, TYPE_PROXY_CONNECT}} in
+     * {@code ExtensionHistory.getHistoryIds()}), so an entry of this type is listed both when it is
+     * added and whenever the history view is rebuilt.
+     */
+    static final int HISTORY_TYPE_RECORDED = HistoryReference.TYPE_ZAP_USER;
+
+    /**
+     * History type for a discovered entry when it must not be listed in the history tab.
+     *
+     * <p>{@link HistoryReference#TYPE_HIDDEN} is not in the set the history tab queries and is not a
+     * "temporary" type (so the reference is still written to the session database and the node still
+     * survives a session reload). It is the only reliable way to keep an entry out of that tab: the
+     * tab is not just fed by {@code ExtensionHistory.addHistory}, it is also rebuilt from the
+     * session history by {@code ExtensionHistory.getHistoryIds()}, which the in-scope toggle, the
+     * history filter and opening a session all trigger.
+     */
+    static final int HISTORY_TYPE_NOT_RECORDED = HistoryReference.TYPE_HIDDEN;
+
     private static final int MAX_SEEN = 50000;
 
     // Upper bound on placeholder nodes created from a single response, so one crafted page cannot
@@ -106,6 +148,13 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     private static final int MAX_INSERTS_PER_RESPONSE = 200;
 
     private static final Pattern TEMPLATE_LITERAL = Pattern.compile("`([^`]*\\$\\{[^`]*\\}[^`]*)`");
+
+    // Compiled once: this runs for every template-literal candidate, and String.replaceAll would
+    // re-compile the pattern on each of them.
+    private static final Pattern INTERPOLATION = Pattern.compile("\\$\\{[^}]*\\}");
+
+    // Longest candidate accepted into the candidate set (a longer one is dropped in addCandidate).
+    private static final int MAX_CANDIDATE_LENGTH = 2000;
 
     // Ported from xnLinkFinder (https://github.com/xnl-h4ck3r/xnLinkFinder) - file extensions that
     // indicate a real resource/endpoint (as opposed to a generic [a-zA-Z]{1,4} extension). Used by
@@ -224,16 +273,29 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     private static final Pattern MIMETYPE_PREFIX =
             Pattern.compile("^(?:application|image|model|video|audio|text)/", Pattern.CASE_INSENSITIVE);
 
-    // Batch EDT updates to prevent UI freezing
+    // Batch EDT updates to prevent UI freezing. The queue is drained in bounded slices so one EDT
+    // callback can never run an unbounded number of Site tree mutations.
     private static final Queue<Runnable> EDT_BATCH = new ConcurrentLinkedQueue<>();
     private static final AtomicBoolean EDT_FLUSH_SCHEDULED = new AtomicBoolean(false);
-    private static final int BATCH_FLUSH_MS = 100;
+    private static final int MAX_EDT_TASKS_PER_FLUSH = 50;
 
-    // Rate limiting for tree insertions (token bucket)
-    private static final AtomicInteger INSERT_TOKENS = new AtomicInteger(50);
+    // Rate limiting for tree insertions (token bucket, per session). Refilled by an executor owned
+    // by this listener so it is released in shutdown() rather than pinning the add-on class loader.
     private static final int MAX_INSERT_TOKENS = 50;
-    private static final ScheduledExecutorService TOKEN_REFILL = 
-            createTokenRefillExecutor();
+    private static final int INSERT_TOKEN_REFILL_PER_TICK = 10;
+    private static final long INSERT_TOKEN_REFILL_MS = 100L;
+
+    // Waiting for the base host node (see HostWait): bounded total wait and poll interval. The node
+    // is created by the EDT almost immediately, so this is only a short race-window wait; keeping it
+    // short matters because a worker thread is occupied for its whole duration and the default pool
+    // is only 2 threads wide.
+    private static final long HOST_WAIT_TIMEOUT_MS = 500L;
+    private static final long HOST_WAIT_POLL_MS = 50L;
+
+    // Load shedding on the network thread: a task that is queued but has not started yet has already
+    // cost a full body copy, so responses are dropped while the parse queue is this deep rather than
+    // queueing work that may only be picked up long after the response is irrelevant.
+    private static final int MAX_QUEUED_RESPONSES = 16;
 
     // Large responses are searched in overlapping chunks to keep regex work bounded (xnLinkFinder
     // uses the same threshold/sizes).
@@ -252,6 +314,18 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         {"&quot;|&#34;|&#034;|&#x22;|%22|\\\\u0022", "\""},
         {"&nbsp;", " "},
     };
+
+    // The mappings are compiled once (String.replaceAll would re-parse and re-compile them on every
+    // response) and applied in order, because a decoded value can itself be encodable.
+    private static final Pattern[] ENCODED_CHAR_PATTERNS = buildEncodedCharPatterns();
+
+    private static Pattern[] buildEncodedCharPatterns() {
+        Pattern[] patterns = new Pattern[ENCODED_CHAR_MAPPINGS.length];
+        for (int i = 0; i < ENCODED_CHAR_MAPPINGS.length; i++) {
+            patterns[i] = Pattern.compile("(?i)" + ENCODED_CHAR_MAPPINGS[i][0]);
+        }
+        return patterns;
+    }
 
     // A single hostname label: starts and ends with an alphanumeric (or non-ASCII letter/digit) and
     // may only contain hyphens/underscores inside. This rejects labels that begin or end with '-'
@@ -354,17 +428,39 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                             }));
     private static long currentSessionId = -1L;
 
+    // ZAP's History extension (the History tab). Resolved lazily on first use and only cached when
+    // it was found, so headless runs - where Control is not initialised - simply never cache it.
+    private static volatile ExtensionHistory historyExtension;
+
     private final LinkExtractorOptionsParam options;
-    private final ExecutorService pool;
+    // ThreadPoolExecutor (not the ExecutorService interface) so the network-thread saturation
+    // gate below can inspect the queue depth before it pays for the body snapshot.
+    private final ThreadPoolExecutor pool;
+    private final AtomicInteger insertTokens = new AtomicInteger(MAX_INSERT_TOKENS);
+    private final ScheduledExecutorService tokenRefill;
 
     public LinkExtractorNetworkListener(LinkExtractorOptionsParam options) {
         this.options = options;
         this.pool = createPool(options.getThreads());
+        this.tokenRefill = createTokenRefillExecutor();
+    }
+
+    /**
+     * Releases everything this listener owns: the worker pool, the token-refill executor and any
+     * queued EDT work. Called when the ZAP session that created the listener ends (or the add-on is
+     * unloaded), so neither the pool threads nor the scheduler outlive it.
+     */
+    public void shutdown() {
+        pool.shutdownNow();
+        tokenRefill.shutdownNow();
+        // Queued tasks target this session's site tree, which is going away.
+        EDT_BATCH.clear();
+        resetSeen();
     }
 
     // Daemon worker pool (the add-on is passive); default AbortPolicy on purpose - a saturated
     // queue DROPS the parse rather than running it inline on the network/proxy thread.
-    private ExecutorService createPool(int threads) {
+    private ThreadPoolExecutor createPool(int threads) {
         AtomicInteger counter = new AtomicInteger();
         ThreadFactory threadFactory =
                 r -> {
@@ -384,30 +480,52 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         return pool;
     }
 
-    private static ScheduledExecutorService createTokenRefillExecutor() {
+    private ScheduledExecutorService createTokenRefillExecutor() {
         ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "ZAP-LinkExtractor-TokenRefill");
             t.setDaemon(true);
             return t;
         });
-        executor.scheduleAtFixedRate(() -> 
-            INSERT_TOKENS.updateAndGet(v -> Math.min(MAX_INSERT_TOKENS, v + 10)), 0, 100, TimeUnit.MILLISECONDS);
+        executor.scheduleAtFixedRate(
+                () ->
+                        insertTokens.updateAndGet(
+                                v -> Math.min(MAX_INSERT_TOKENS, v + INSERT_TOKEN_REFILL_PER_TICK)),
+                0,
+                INSERT_TOKEN_REFILL_MS,
+                TimeUnit.MILLISECONDS);
         return executor;
     }
 
-    private static boolean tryAcquireInsertToken() {
-        return INSERT_TOKENS.updateAndGet(v -> v > 0 ? v - 1 : 0) >= 0;
+    private boolean tryAcquireInsertToken() {
+        // The bucket must actually deny when empty. A "clamp to zero" update (v > 0 ? v - 1 : 0)
+        // would leave the result at 0, which satisfies a ">= 0" test and hand out a token every
+        // single time - i.e. no rate limiting at all.
+        int remaining = insertTokens.get();
+        while (remaining > 0) {
+            if (insertTokens.compareAndSet(remaining, remaining - 1)) {
+                return true;
+            }
+            remaining = insertTokens.get();
+        }
+        return false;
     }
 
     private static void scheduleEdtFlush() {
         if (EDT_FLUSH_SCHEDULED.compareAndSet(false, true)) {
-            EventQueue.invokeLater(() -> {
-                EDT_FLUSH_SCHEDULED.set(false);
-                Runnable task;
-                while ((task = EDT_BATCH.poll()) != null) {
-                    task.run();
-                }
-            });
+            EventQueue.invokeLater(
+                    () -> {
+                        EDT_FLUSH_SCHEDULED.set(false);
+                        int ran = 0;
+                        Runnable task;
+                        while (ran < MAX_EDT_TASKS_PER_FLUSH && (task = EDT_BATCH.poll()) != null) {
+                            task.run();
+                            ran++;
+                        }
+                        // More than one slice worth of work: keep the EDT responsive and continue.
+                        if (!EDT_BATCH.isEmpty()) {
+                            scheduleEdtFlush();
+                        }
+                    });
         }
     }
 
@@ -422,7 +540,11 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                 Pattern.compile(
                         "(?<![\\w:.])[\\w:-]*?(?:href|src|action|poster|cite|formaction|background|longdesc|usemap|manifest|codebase|profile)\\s*=\\s*[\"']([^\"'#\\s>]+)[\"']",
                         Pattern.CASE_INSENSITIVE));
-        patterns.add(Pattern.compile("(?is)<meta[^>]*?url\\s*=\\s*([^\"'#\\s>]+)"));
+        // The lazy runs below are bounded: "[^>]*?" and "[^}]*?" with an absent terminator (an
+        // unclosed "<meta" or "$.ajax({") make the matcher re-scan to the end of the body for every
+        // start offset, i.e. quadratic work on a crafted page. The cap is far beyond any real
+        // attribute/option run while keeping the scan linear.
+        patterns.add(Pattern.compile("(?i)<meta[^>]{0,2000}?url\\s*=\\s*([^\"'#\\s>]+)"));
         patterns.add(Pattern.compile("url\\(\\s*[\"']?([^\"')\\s]+)[\"']?\\s*\\)", Pattern.CASE_INSENSITIVE)); // CSS url(...)
 
         // Bare absolute http(s) URLs and protocol-relative URLs appearing anywhere in the body
@@ -460,7 +582,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         patterns.add(Pattern.compile("\\brequire(?:\\.resolve)?\\(\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)); // require("...")
         patterns.add(Pattern.compile("(?:window\\.)?location(?:\\.href)?\\s*=\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)); // location / location.href / window.location(.href) =
         patterns.add(Pattern.compile("window\\.open\\(\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)); // window.open("...")
-        patterns.add(Pattern.compile("\\$\\.ajax\\(\\s*\\{[^}]*?url\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)); // $.ajax({ url: "..." })
+        patterns.add(Pattern.compile("\\$\\.ajax\\(\\s*\\{[^}]{0,2000}?url\\s*:\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)); // $.ajax({ url: "..." }) - bounded run, see above
         patterns.add(Pattern.compile("\\$\\.(?:get|post|getJSON)\\(\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)); // $.get/$.post/$.getJSON("...")
         patterns.add(Pattern.compile("axios(?:\\.(?:get|post|put|patch|delete|head|request))?\\(\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)); // axios(...) / axios.get(...)
         patterns.add(Pattern.compile("new\\s+WebSocket\\(\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)); // new WebSocket("wss://...")
@@ -516,11 +638,27 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
             if (msg == null || msg.getResponseHeader() == null) {
                 return;
             }
-            if (msg.getResponseBody().length() == 0) {
+            final int bodyLength = msg.getResponseBody().length();
+            if (bodyLength == 0) {
                 return;
             }
 
-            
+            // Body-size gate, the cheapest rejection there is and the last unbounded input left: the
+            // body is snapshotted on the network thread below and decoded to a String on the worker,
+            // and the decoders can hold several further copies of it, so without this a single huge
+            // response is enough to stall the request/response path and to spike memory. The limit is
+            // configurable (Tools > Options > Site tree); responses above it are not scanned at all.
+            final long maxBodyBytes = options.getMaxBodyBytes();
+            if (!isBodyWithinScanLimit(bodyLength, maxBodyBytes)) {
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug(
+                            "LinkExtractor: body of {} bytes is over the {} byte scan limit, skipping {}",
+                            bodyLength,
+                            maxBodyBytes,
+                            msg.getRequestHeader().getURI());
+                }
+                return;
+            }
 
             // Only bother parsing response types that could plausibly contain links.
             String contentType = msg.getResponseHeader().getHeader(HttpHeader.CONTENT_TYPE);
@@ -557,6 +695,16 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                 return;
             }
 
+            // Saturation gate, before the copy below: a task that waits in the queue has still cost a
+            // full body copy on the proxy thread, and it may only be picked up long after the
+            // response stopped being relevant. Drop the response instead of queueing it.
+            if (isParseQueueFull(pool.getQueue().size())) {
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("LinkExtractor: parse queue is full, dropping {}", baseUrlStr);
+                }
+                return;
+            }
+
             // Snapshot the body bytes and its charset on the network thread (getBytes() returns a
             // reference to the message's internal array, which the proxy may mutate afterwards) and
             // decode/parse on the worker so a large body never stalls the request/response flow.
@@ -564,7 +712,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
             if (bodyBytes == null) {
                 return;
             }
-            final byte[] bodySnapshot = Arrays.copyOf(bodyBytes, msg.getResponseBody().length());
+            final byte[] bodySnapshot = Arrays.copyOf(bodyBytes, bodyLength);
             final String charset = msg.getResponseBody().getCharset();
 
             // SourceMap / X-SourceMap response headers point at the source map for the served
@@ -648,6 +796,63 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         return SEEN.contains(url);
     }
 
+    /** Package-private test hook: number of insertion tokens currently available. */
+    int availableInsertTokens() {
+        return insertTokens.get();
+    }
+
+    /** Package-private test hook: forces the insertion token bucket to {@code tokens}. */
+    void setInsertTokens(int tokens) {
+        insertTokens.set(tokens);
+    }
+
+    /** Package-private test hook: attempts to consume one insertion token. */
+    boolean acquireInsertToken() {
+        return tryAcquireInsertToken();
+    }
+
+    /**
+     * The history type to create a discovered entry with, driven by the "record in the history tab"
+     * option.
+     *
+     * <p>A Site tree node is always backed by a {@link HistoryReference} row, so the entry exists in
+     * the session history either way; the type is what decides whether ZAP's history tab can list
+     * it. Listing it is not something the tab only learns from
+     * {@code ExtensionHistory.addHistory(...)}: the tab is rebuilt from the session history by
+     * {@code ExtensionHistory.getHistoryIds()}, which only selects the proxied, ZAP-user and
+     * proxy-connect types and is re-run by the in-scope toggle, the history filter and session loads.
+     * Picking the type is therefore the only way to make the option hold.
+     *
+     * @param recordInHistoryTab whether the entry should be listed in the history tab.
+     * @return {@link #HISTORY_TYPE_RECORDED} or {@link #HISTORY_TYPE_NOT_RECORDED}.
+     */
+    static int historyTypeFor(boolean recordInHistoryTab) {
+        return recordInHistoryTab ? HISTORY_TYPE_RECORDED : HISTORY_TYPE_NOT_RECORDED;
+    }
+
+    /**
+     * The body-size gate's decision, as a pure function of the response length and the configured
+     * limit, so the boundary (a body of exactly the limit is still scanned) can be pinned by a test
+     * without standing up a message.
+     *
+     * @param bodyLength the response body length in bytes.
+     * @param maxBodyBytes the configured limit in bytes.
+     * @return whether the body is small enough to be scanned at all.
+     */
+    static boolean isBodyWithinScanLimit(int bodyLength, long maxBodyBytes) {
+        return bodyLength <= maxBodyBytes;
+    }
+
+    /**
+     * The saturation gate's decision, as a pure function of the current queue depth.
+     *
+     * @param queuedResponses the number of tasks waiting in the parse queue.
+     * @return whether the response should be dropped instead of snapshotted and queued.
+     */
+    static boolean isParseQueueFull(int queuedResponses) {
+        return queuedResponses >= MAX_QUEUED_RESPONSES;
+    }
+
     private void processResponse(
             String baseUrlStr, byte[] bodyBytes, String charset, List<String> extraCandidates) {
         try {
@@ -660,6 +865,9 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
             if (baseHost != null) {
                 baseHost = baseHost.toLowerCase(Locale.ROOT);
             }
+            // Constant for the whole response: the registrable domain of the (in-scope) source host,
+            // needed by every cross-host candidate. Hoisted out of the candidate loop.
+            String baseRegistrable = registrableDomain(baseHost);
 
             String body = new String(bodyBytes, Charset.forName(charset));
             Set<String> found = extractCandidates(body, options.isParseJavascript());
@@ -674,24 +882,31 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                     }
                 }
             }
-            LOGGER.info(
-                    "LinkExtractor: parsed {} bytes, found {} candidates from {}",
-                    bodyBytes.length,
-                    found.size(),
-                    baseUrlStr);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug(
+                        "LinkExtractor: parsed {} bytes, found {} candidates from {}",
+                        bodyBytes.length,
+                        found.size(),
+                        baseUrlStr);
+            }
             if (found.isEmpty()) {
                 return;
             }
 
             SiteMap siteTree = session.getSiteTree();
+            // Tracks the base host node for the whole response (see HostWait), so the wait is paid
+            // at most once no matter how many candidates the response yields.
+            HostWait hostWait = new HostWait(siteTree, baseHost);
 
             int inserted = 0;
             for (String raw : found) {
                 if (inserted >= MAX_INSERTS_PER_RESPONSE) {
-                    LOGGER.info(
-                            "LinkExtractor: per-response insert cap ({}) reached for {}",
-                            MAX_INSERTS_PER_RESPONSE,
-                            baseUrlStr);
+                    if (LOGGER.isDebugEnabled()) {
+                        LOGGER.debug(
+                                "LinkExtractor: per-response insert cap ({}) reached for {}",
+                                MAX_INSERTS_PER_RESPONSE,
+                                baseUrlStr);
+                    }
                     break;
                 }
                 // Bare "//host/path" protocol-relative URLs need the scheme from the base page
@@ -754,7 +969,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                 // domain - or when the resolved URL is itself explicitly within the session scope
                 // (multi-domain contexts). Unrelated third-party hosts never reach the Site tree.
                 if (isNewSubdomain
-                        && !isSameDomainFamily(baseHost, discoveredHost)
+                        && !isSameDomainFamily(baseHost, baseRegistrable, discoveredHost)
                         && !session.isInScope(resolved)) {
                     continue;
                 }
@@ -797,6 +1012,9 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                         continue;
                     }
                 } catch (Exception e) {
+                    // The lookup itself failed, so nothing is known about this URL: forget the dedup
+                    // entry again, otherwise the node could never be re-added on a later visit.
+                    SEEN.remove(resolved);
                     continue;
                 }
 
@@ -806,7 +1024,18 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
                             resolved,
                             isNewSubdomain ? "(new subdomain)" : "");
                 }
-                addPlaceholderNode(session, siteTree, targetUri, isNewSubdomain, baseUrlStr);
+                if (!addPlaceholderNode(
+                        session,
+                        siteTree,
+                        hostWait,
+                        targetUri,
+                        isNewSubdomain,
+                        options.isRecordInProxyHistory())) {
+                    // Not inserted (rate limited, or the history reference could not be created):
+                    // nothing was persisted, so release the dedup entry for a later retry.
+                    SEEN.remove(resolved);
+                    continue;
+                }
                 inserted++;
             }
         } catch (Throwable t) {
@@ -888,7 +1117,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
 
             // Template-literal group: normalise interpolations first.
             if (re == TEMPLATE_LITERAL) {
-                candidate = candidate.replaceAll("\\$\\{[^}]*\\}", "__DYNAMIC__");
+                candidate = INTERPOLATION.matcher(candidate).replaceAll("__DYNAMIC__");
             }
 
             // Bare-domain group: only accept strings that look like a real host with a plausible
@@ -925,7 +1154,11 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         }
         link = link.trim();
         link = stripChars(link, "\"'\n\r( ");
-        link = link.replace("\\n", "").replace("\\r", "").replace("\\.", ".");
+        if (link.indexOf('\\') != -1) {
+            // Only candidates that actually contain a backslash can match any of these; the
+            // String.replace calls return the same instance otherwise, but still scan.
+            link = link.replace("\\n", "").replace("\\r", "").replace("\\.", ".");
+        }
         if (link.isEmpty()) {
             return null;
         }
@@ -953,9 +1186,24 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
             link = link.substring(leadingNewline ? 2 : 1, link.length() - (trailingNewline ? 2 : 1));
         }
 
-        // Trailing backslashes, then '>', ';', ','.
-        link = link.replaceAll("\\\\+$", "");
-        link = link.replaceAll("[>;,]+$", "");
+        // Trailing backslashes, then '>', ';', ','. Equivalent to the previous
+        // replaceAll("\\\\+$", "") / replaceAll("[>;,]+$", "") without compiling two patterns per
+        // candidate.
+        int end = link.length();
+        while (end > 0 && link.charAt(end - 1) == '\\') {
+            end--;
+        }
+        while (end > 0) {
+            char c = link.charAt(end - 1);
+            if (c == '>' || c == ';' || c == ',') {
+                end--;
+            } else {
+                break;
+            }
+        }
+        if (end != link.length()) {
+            link = link.substring(0, end);
+        }
 
         // Everything from the first backtick onwards is junk (template literal remainder).
         int backtick = link.indexOf('`');
@@ -996,6 +1244,15 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
      * unbalanced closing bracket, and removes trailing opening brackets left unmatched at the end.
      */
     private static String stripUnbalancedBrackets(String link) {
+        if (link.indexOf('(') == -1
+                && link.indexOf('[') == -1
+                && link.indexOf('{') == -1
+                && link.indexOf(')') == -1
+                && link.indexOf(']') == -1
+                && link.indexOf('}') == -1) {
+            // No brackets at all: nothing to strip, and nothing to allocate a stack for.
+            return link;
+        }
         int lastValidIndex = link.length();
         Deque<Integer> stack = new ArrayDeque<>();
         for (int i = 0; i < link.length(); i++) {
@@ -1121,6 +1378,21 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
      * @return {@code true} if the candidate belongs to the base host's domain family.
      */
     static boolean isSameDomainFamily(String baseHost, String discoveredHost) {
+        return isSameDomainFamily(baseHost, registrableDomain(baseHost), discoveredHost);
+    }
+
+    /**
+     * As {@link #isSameDomainFamily(String, String)}, with the registrable domain of the base host
+     * supplied by the caller: it is the same for every candidate of a response, so it is computed
+     * once per response instead of once per candidate.
+     *
+     * @param baseHost the (in-scope) source host, may be {@code null}.
+     * @param baseRegistrableDomain the registrable domain of {@code baseHost}, may be {@code null}.
+     * @param discoveredHost the candidate host, may be {@code null}.
+     * @return {@code true} if the candidate belongs to the base host's domain family.
+     */
+    static boolean isSameDomainFamily(
+            String baseHost, String baseRegistrableDomain, String discoveredHost) {
         if (baseHost == null || discoveredHost == null) {
             return false;
         }
@@ -1129,9 +1401,8 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         if (b.equals(d) || d.endsWith("." + b)) {
             return true;
         }
-        String bDomain = registrableDomain(b);
         String dDomain = registrableDomain(d);
-        return bDomain != null && bDomain.equals(dDomain);
+        return dDomain != null && dDomain.equals(baseRegistrableDomain);
     }
 
     /**
@@ -1194,14 +1465,21 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
     /**
      * Decodes the encoded forms of '/' ':' '&' '=' '"' and non-breaking space that xnLinkFinder
      * normalises before searching.
+     *
+     * <p>Every alternative of every mapping contains '%', '&amp;' or a backslash, so a body that
+     * contains none of those three characters cannot contain anything to decode and is returned
+     * unchanged without running the mappings.
      */
     static String decodeEncodedChars(String body) {
         if (body == null) {
             return "";
         }
+        if (body.indexOf('%') == -1 && body.indexOf('&') == -1 && body.indexOf('\\') == -1) {
+            return body;
+        }
         String decoded = body;
-        for (String[] mapping : ENCODED_CHAR_MAPPINGS) {
-            decoded = decoded.replaceAll("(?i)" + mapping[0], mapping[1]);
+        for (int i = 0; i < ENCODED_CHAR_PATTERNS.length; i++) {
+            decoded = ENCODED_CHAR_PATTERNS[i].matcher(decoded).replaceAll(ENCODED_CHAR_MAPPINGS[i][1]);
         }
         return decoded;
     }
@@ -1254,7 +1532,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
             return;
         }
         String link = raw.trim();
-        if (link.isEmpty() || link.length() > 2000) {
+        if (link.isEmpty() || link.length() > MAX_CANDIDATE_LENGTH) {
             return;
         }
         String lower = link.toLowerCase(Locale.ROOT);
@@ -1328,8 +1606,20 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         return false;
     }
 
-    private static void addPlaceholderNode(
-            Session session, SiteMap siteTree, URI uri, boolean isNewSubdomain, String baseUrlStr) {
+    /**
+     * Creates the placeholder node backing one discovered URL: a history reference (which persists
+     * the synthetic request-only message) plus a batched Site tree insertion.
+     *
+     * @return {@code true} if the entry was created and handed to the Site tree, {@code false} if
+     *     nothing was persisted (rate limited, or the history reference could not be created).
+     */
+    private boolean addPlaceholderNode(
+            Session session,
+            SiteMap siteTree,
+            HostWait hostWait,
+            URI uri,
+            boolean isNewSubdomain,
+            boolean recordInProxyHistory) {
         // Rate limit tree insertions BEFORE anything is persisted: creating the HistoryReference
         // writes a row to the session database, so without this gate a crafted page full of unique
         // URLs could flood the database regardless of how fast the UI can keep up.
@@ -1337,7 +1627,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.debug("LinkExtractor: rate limited, skipping {}", uri);
             }
-            return;
+            return false;
         }
 
         // Build the synthetic message + HistoryReference on the worker thread (the HistoryReference
@@ -1345,6 +1635,7 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
         // as required by SiteMap.
         final HttpMessage newMsg = new HttpMessage();
         final HistoryReference hr;
+        final int historyType = historyTypeFor(recordInProxyHistory);
         try {
             HttpRequestHeader reqHeader = new HttpRequestHeader("GET", uri, "HTTP/1.1");
             newMsg.setRequestHeader(reqHeader);
@@ -1354,10 +1645,14 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
             // (the empty response header round-trips through the database without re-parsing), so
             // no placeholder status line is needed - a synthetic "HTTP/1.1 999 ..." header was
             // removed precisely because a fabricated status line cannot survive the DB round-trip.
-            hr = new HistoryReference(session, HistoryReference.TYPE_ZAP_USER, newMsg);
+            //
+            // The history type is the option switch: a node always needs a history reference, and
+            // that type is what decides whether ZAP's history tab may list this entry (live and on
+            // any rebuild of the tab). See historyTypeFor(boolean).
+            hr = new HistoryReference(session, historyType, newMsg);
         } catch (Exception e) {
             LOGGER.warn("LinkExtractor: failed to create HistoryReference for {}", uri, e);
-            return;
+            return false;
         }
 
         String note = NOTE_BODY;
@@ -1368,66 +1663,97 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
 
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug(
-                    "LinkExtractor: HistoryReference {} created for {} note={}",
+                    "LinkExtractor: HistoryReference {} created for {} note={} type={} ({} history tab)",
                     hr.getHistoryId(),
                     uri,
-                    note);
+                    note,
+                    historyType,
+                    recordInProxyHistory ? "in" : "not in");
         }
 
-        // SiteMap.addPath(HistoryReference, HttpMessage) is NOT synchronized (only addPath(ref) is),
-        // so a caller inserting at the same moment as the proxy's own addToSiteMap can race its host
-        // creation and end up with two sibling host nodes. The proxy always adds the real message,
-        // so for same-host candidates we first wait for that host node to appear before inserting;
-        // insertNode then serialises all our own inserts so we never race ourselves either.
+        // Close the addPath race window for same-host candidates (see HostWait): the base host node
+        // is waited for at most once per response, never per insertion.
         if (!isNewSubdomain) {
-            waitForHost(siteTree, baseUrlStr).join();
+            hostWait.ensureHostPresent();
         }
-        insertNodeBatched(siteTree, hr, newMsg);
+        insertNodeBatched(siteTree, hr, newMsg, recordInProxyHistory);
+        return true;
     }
 
     /**
-     * Waits asynchronously until the base host of {@code hostUrl} is present in the tree, or a
-     * bounded timeout elapses. The proxy inserts the real (in-scope) message right after the
-     * response, so for same-host candidates this guarantees ZAP's host node exists before we add
-     * ours, closing the addPath race window.
+     * Waits at most once per response for the base host node to be present in the tree.
      *
-     * @param siteTree the site tree.
-     * @param hostUrl the base URL whose host node should appear.
-     * @return a CompletableFuture that completes with {@code true} if the host appeared in time,
-     *         {@code false} if the timeout elapsed.
+     * <p>{@code SiteMap.addPath(HistoryReference, HttpMessage)} is not synchronized (only
+     * {@code addPath(ref)} is), so a caller inserting at the same moment as the proxy's own
+     * {@code addToSiteMap} can race its host creation and end up with two sibling host nodes. The
+     * proxy always adds the real (in-scope) message, so for same-host candidates this waits for
+     * that host node to appear before we add ours; our own inserts are serialised by
+     * {@link #insertNodeBatched}, so we never race each other either.
+     *
+     * <p>The wait is per response rather than per candidate: the base host is the same for every
+     * candidate of a response and its presence is monotonic, so one bounded poll is enough, and a
+     * timeout is not retried (otherwise a page whose host node never appears would pay the full
+     * timeout once per candidate). The poll runs inline on the worker thread, so no extra thread is
+     * created per insertion.
      */
-    private static CompletableFuture<Boolean> waitForHost(SiteMap siteTree, String hostUrl) {
-        CompletableFuture<Boolean> future = new CompletableFuture<>();
-        try {
-            URI hostUri = new URI(hostUrl, false);
-            new Thread(() -> {
-                long deadline = System.currentTimeMillis() + 1500L;
-                while (System.currentTimeMillis() < deadline) {
-                    if (siteTree.findNode(hostUri) != null) {
-                        future.complete(true);
+    private static final class HostWait {
+
+        private final SiteMap siteTree;
+        private final String baseHost;
+        private boolean attempted;
+
+        HostWait(SiteMap siteTree, String baseHost) {
+            this.siteTree = siteTree;
+            this.baseHost = baseHost;
+        }
+
+        void ensureHostPresent() {
+            if (attempted || siteTree == null || baseHost == null || baseHost.isEmpty()) {
+                return;
+            }
+            attempted = true;
+            URI hostUri;
+            try {
+                hostUri = new URI(baseHost, false);
+            } catch (Exception e) {
+                return;
+            }
+            long deadline = System.currentTimeMillis() + HOST_WAIT_TIMEOUT_MS;
+            try {
+                while (siteTree.findNode(hostUri) == null) {
+                    if (System.currentTimeMillis() >= deadline) {
                         return;
                     }
-                    try { Thread.sleep(50); } catch (InterruptedException e) { break; }
+                    Thread.sleep(HOST_WAIT_POLL_MS);
                 }
-                future.complete(false);
-            }, "ZAP-LinkExtractor-WaitForHost").start();
-        } catch (Exception e) {
-            future.complete(false);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("LinkExtractor: host wait failed for {}", baseHost, e);
+                }
+            }
         }
-        return future;
     }
 
     /**
      * Serialises all our tree insertions (SiteMap.addPath(HistoryReference, HttpMessage) is not
      * synchronized, so our own concurrent worker threads could otherwise race each other), then runs
      * the mutation on the Swing EDT using batched updates to prevent UI freezing.
+     *
+     * @param siteTree the site tree.
+     * @param hr the history reference created for the discovered URL.
+     * @param msg the (request-only) message the reference was created from.
+     * @param recordInProxyHistory whether the entry is also to be recorded in the history tab.
      */
-    private static synchronized void insertNodeBatched(SiteMap siteTree, HistoryReference hr, HttpMessage msg) {
-        EDT_BATCH.offer(() -> addPath(siteTree, hr, msg));
+    private static synchronized void insertNodeBatched(
+            SiteMap siteTree, HistoryReference hr, HttpMessage msg, boolean recordInProxyHistory) {
+        EDT_BATCH.offer(() -> addPath(siteTree, hr, msg, recordInProxyHistory));
         scheduleEdtFlush();
     }
 
-    private static void addPath(SiteMap siteTree, HistoryReference hr, HttpMessage msg) {
+    private static void addPath(
+            SiteMap siteTree, HistoryReference hr, HttpMessage msg, boolean recordInProxyHistory) {
         try {
             SiteNode node = siteTree.addPath(hr, msg);
             if (LOGGER.isDebugEnabled()) {
@@ -1438,6 +1764,76 @@ public class LinkExtractorNetworkListener implements HttpSenderListener, EventCo
             }
         } catch (Exception e) {
             LOGGER.warn("LinkExtractor: addPath failed for {}", msg.getRequestHeader().getURI(), e);
+            // The reference was already written to the session database; without the node it is an
+            // orphan row nothing in the UI can reach, so remove it again.
+            try {
+                hr.delete();
+            } catch (Exception deleteError) {
+                LOGGER.warn("LinkExtractor: failed to remove orphaned history entry", deleteError);
+            }
+            return;
         }
+
+        // The node is in the Site tree; the same entry can now be recorded in the history tab too,
+        // so a discovered link or subdomain shows up in both places.
+        if (recordInProxyHistory) {
+            addToProxyHistory(hr);
+        }
+    }
+
+    /**
+     * Registers an already-created entry with ZAP's history (the <em>history tab</em>).
+     *
+     * <p>Uses {@link ExtensionHistory#addHistory(HistoryReference)} - the same entry point ZAP's own
+     * Requester uses - so the History view owns the update: it marshals the change onto the EDT and
+     * applies its own filters. Nothing is sent to the discovered URL, and the entry keeps the
+     * "not requested" note. Only called when the option is enabled, i.e. when the reference was
+     * created with {@link #HISTORY_TYPE_RECORDED} - the type itself is what keeps the entry in the
+     * history tab across rebuilds of that view.
+     *
+     * @param hr the history reference created for the discovered URL.
+     */
+    private static void addToProxyHistory(HistoryReference hr) {
+        try {
+            ExtensionHistory history = getHistoryExtension();
+            if (history == null) {
+                return;
+            }
+            history.addHistory(hr);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug(
+                        "LinkExtractor: added HistoryReference {} to the history tab",
+                        hr.getHistoryId());
+            }
+        } catch (Throwable t) {
+            LOGGER.warn("LinkExtractor: failed to add {} to the history tab", hr.getURI(), t);
+        }
+    }
+
+    /**
+     * The ZAP History extension, resolved on first use (it is a core extension, but it is not
+     * guaranteed to be present in headless/test runs).
+     *
+     * @return the History extension, or {@code null} if it is not available.
+     */
+    private static ExtensionHistory getHistoryExtension() {
+        ExtensionHistory ext = historyExtension;
+        if (ext != null) {
+            return ext;
+        }
+        try {
+            Control control = Control.getSingleton();
+            if (control == null) {
+                return null;
+            }
+            ext = control.getExtensionLoader().getExtension(ExtensionHistory.class);
+        } catch (Throwable t) {
+            LOGGER.debug("LinkExtractor: History extension not available", t);
+            return null;
+        }
+        if (ext != null) {
+            historyExtension = ext;
+        }
+        return ext;
     }
 }
