@@ -10,7 +10,8 @@ version = "1.2.0"
 description =
     "Network-layer Burp-style link extraction: runs inline on every response ZAP receives and, for " +
         "in-scope sources, adds URLs discovered in HTML/JS/CSS/JSON/XML bodies to the Site tree as " +
-        "unrequested (TYPE_ZAP_USER) entries, without sending any requests to them."
+        "unrequested entries, without sending any requests to them. Discovered entries can optionally " +
+        "be listed in the history tab."
 
 repositories {
     mavenCentral()
