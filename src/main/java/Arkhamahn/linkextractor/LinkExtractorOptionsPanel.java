@@ -7,17 +7,20 @@ import javax.swing.JCheckBox;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JSlider;
+import javax.swing.JSpinner;
+import javax.swing.SpinnerNumberModel;
 import org.parosproxy.paros.Constant;
 import org.parosproxy.paros.model.OptionsParam;
 import org.parosproxy.paros.view.AbstractParamPanel;
 import org.zaproxy.zap.utils.ZapHtmlLabel;
 
 /**
- * Options panel shown under <em>Tools > Options > Site tree</em>.
+ * Options panel shown under <em>Tools &gt; Options &gt; Site tree</em>.
  *
  * <p>Provides toggles for the optional behaviours of the {@link LinkExtractorNetworkListener}:
- * JavaScript parsing, subdomain discovery (body links and response headers), and thread
- * concurrency.
+ * JavaScript parsing, subdomain discovery (body links and response headers), recording the
+ * discovered links and subdomains in the history tab, and inputs for thread concurrency and the
+ * maximum response body size that is scanned.
  */
 public class LinkExtractorOptionsPanel extends AbstractParamPanel {
 
@@ -30,7 +33,9 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
     private JCheckBox parseJavascriptCheckBox;
     private JCheckBox discoverSubdomainsCheckBox;
     private JCheckBox discoverSubdomainsFromHeadersCheckBox;
+    private JCheckBox recordInProxyHistoryCheckBox;
     private JSlider threadsSlider;
+    private JSpinner maxBodySizeSpinner;
 
     public LinkExtractorOptionsPanel(LinkExtractorOptionsParam optionsParam) {
         super();
@@ -63,10 +68,16 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
         add(getDiscoverSubdomainsFromHeadersCheckBox(), gbc);
 
         gbc.gridy = 4;
+        add(getRecordInProxyHistoryCheckBox(), gbc);
+
+        gbc.gridy = 5;
         gbc.insets = new Insets(8, 0, 0, 0);
         add(getThreadsPanel(), gbc);
 
-        gbc.gridy = 5;
+        gbc.gridy = 6;
+        add(getMaxBodySizePanel(), gbc);
+
+        gbc.gridy = 7;
         gbc.weighty = 1.0;
         gbc.fill = GridBagConstraints.BOTH;
         gbc.insets = new Insets(0, 0, 0, 0);
@@ -96,6 +107,15 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
                                     PREFIX + ".label.discoverSubdomainsFromHeaders"));
         }
         return discoverSubdomainsFromHeadersCheckBox;
+    }
+
+    private JCheckBox getRecordInProxyHistoryCheckBox() {
+        if (recordInProxyHistoryCheckBox == null) {
+            recordInProxyHistoryCheckBox =
+                    new JCheckBox(
+                            Constant.messages.getString(PREFIX + ".label.recordInProxyHistory"));
+        }
+        return recordInProxyHistoryCheckBox;
     }
 
     private JPanel getThreadsPanel() {
@@ -132,6 +152,37 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
         return threadsSlider;
     }
 
+    private JPanel getMaxBodySizePanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.gridx = 0;
+        gbc.gridy = 0;
+        gbc.anchor = GridBagConstraints.LINE_START;
+        gbc.insets = new Insets(0, 20, 0, 0);
+        panel.add(new JLabel(Constant.messages.getString(PREFIX + ".label.maxBodySizeMb")), gbc);
+
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.NONE;
+        panel.add(getMaxBodySizeSpinner(), gbc);
+        return panel;
+    }
+
+    private JSpinner getMaxBodySizeSpinner() {
+        if (maxBodySizeSpinner == null) {
+            maxBodySizeSpinner =
+                    new JSpinner(
+                            new SpinnerNumberModel(
+                                    optionsParam.getMaxBodySizeMb(),
+                                    LinkExtractorOptionsParam.MIN_MAX_BODY_SIZE_MB,
+                                    LinkExtractorOptionsParam.MAX_MAX_BODY_SIZE_MB,
+                                    1));
+            maxBodySizeSpinner.setToolTipText(
+                    Constant.messages.getString(PREFIX + ".label.maxBodySizeMb.tooltip"));
+            maxBodySizeSpinner.setPreferredSize(new java.awt.Dimension(80, 24));
+        }
+        return maxBodySizeSpinner;
+    }
+
     @Override
     public void initParam(Object obj) {
         OptionsParam optionsParam = (OptionsParam) obj;
@@ -140,7 +191,15 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
         getDiscoverSubdomainsCheckBox().setSelected(param.isDiscoverSubdomains());
         getDiscoverSubdomainsFromHeadersCheckBox()
                 .setSelected(param.isDiscoverSubdomainsFromHeaders());
+        getRecordInProxyHistoryCheckBox().setSelected(param.isRecordInProxyHistory());
         threadsSlider.setValue(param.getThreads());
+        getMaxBodySizeSpinner()
+                .setValue(
+                        Math.max(
+                                LinkExtractorOptionsParam.MIN_MAX_BODY_SIZE_MB,
+                                Math.min(
+                                        LinkExtractorOptionsParam.MAX_MAX_BODY_SIZE_MB,
+                                        param.getMaxBodySizeMb())));
     }
 
     @Override
@@ -151,6 +210,9 @@ public class LinkExtractorOptionsPanel extends AbstractParamPanel {
         param.setDiscoverSubdomains(getDiscoverSubdomainsCheckBox().isSelected());
         param.setDiscoverSubdomainsFromHeaders(
                 getDiscoverSubdomainsFromHeadersCheckBox().isSelected());
+        param.setRecordInProxyHistory(getRecordInProxyHistoryCheckBox().isSelected());
         param.setThreads(threadsSlider.getValue());
+        param.setMaxBodySizeMb(
+                ((Number) getMaxBodySizeSpinner().getValue()).intValue());
     }
 }
