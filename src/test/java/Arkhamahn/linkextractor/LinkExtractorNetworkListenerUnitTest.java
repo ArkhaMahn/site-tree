@@ -9,10 +9,12 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
+import org.parosproxy.paros.model.HistoryReference;
 import org.parosproxy.paros.model.SiteMapEventPublisher;
 import org.parosproxy.paros.network.HttpHeaderField;
 import org.zaproxy.zap.eventBus.Event;
 import org.zaproxy.zap.model.Target;
+import org.zaproxy.zap.utils.ZapXmlConfiguration;
 
 class LinkExtractorNetworkListenerUnitTest {
 
@@ -20,6 +22,293 @@ class LinkExtractorNetworkListenerUnitTest {
         LinkExtractorOptionsParam options = new LinkExtractorOptionsParam();
         // Don't call parseImpl() as it reads from config; just use defaults
         return options;
+    }
+
+    @Test
+    void shouldNotRecordInProxyHistoryByDefault() {
+        LinkExtractorOptionsParam options = createOptions();
+        options.load(new ZapXmlConfiguration());
+
+        assertFalse(options.isRecordInProxyHistory());
+    }
+
+    @Test
+    void shouldPersistRecordInProxyHistoryOption() {
+        LinkExtractorOptionsParam options = createOptions();
+        options.load(new ZapXmlConfiguration());
+        options.setRecordInProxyHistory(true);
+        assertTrue(options.isRecordInProxyHistory());
+
+        LinkExtractorOptionsParam reloaded = createOptions();
+        reloaded.load(options.getConfig());
+
+        assertTrue(reloaded.isRecordInProxyHistory());
+    }
+
+    @Test
+    void shouldUseZapUserHistoryTypeWhenRecordingInHistoryTab() {
+        assertEquals(
+                HistoryReference.TYPE_ZAP_USER, LinkExtractorNetworkListener.historyTypeFor(true));
+    }
+
+    /**
+     * The body of a response is snapshotted on the network thread and decoded on a worker, so the
+     * size of that body is the one input that could still be made arbitrarily large. The limit is an
+     * option, so it must round-trip through the configuration and stay inside its documented range.
+     */
+    @Test
+    void shouldDefaultTheMaxBodyScanLimitToFiveMegabytes() {
+        LinkExtractorOptionsParam options = createOptions();
+        options.load(new ZapXmlConfiguration());
+
+        assertEquals(5, options.getMaxBodySizeMb());
+        assertEquals(5L * 1024 * 1024, options.getMaxBodyBytes());
+    }
+
+    @Test
+    void shouldPersistMaxBodySizeOption() {
+        LinkExtractorOptionsParam options = createOptions();
+        options.load(new ZapXmlConfiguration());
+        options.setMaxBodySizeMb(12);
+        assertEquals(12, options.getMaxBodySizeMb());
+        assertEquals(12L * 1024 * 1024, options.getMaxBodyBytes());
+
+        LinkExtractorOptionsParam reloaded = createOptions();
+        reloaded.load(options.getConfig());
+
+        assertEquals(12, reloaded.getMaxBodySizeMb());
+    }
+
+    @Test
+    void shouldClampMaxBodySizeToItsRange() {
+        LinkExtractorOptionsParam options = createOptions();
+        options.load(new ZapXmlConfiguration());
+
+        options.setMaxBodySizeMb(0);
+        assertEquals(LinkExtractorOptionsParam.MIN_MAX_BODY_SIZE_MB, options.getMaxBodySizeMb());
+
+        options.setMaxBodySizeMb(9999);
+        assertEquals(LinkExtractorOptionsParam.MAX_MAX_BODY_SIZE_MB, options.getMaxBodySizeMb());
+
+        // A limit out of range in the configuration is clamped on load, not just on set.
+        options.getConfig().setProperty("linkextractor.maxBodySizeMb", 0);
+        options.load(options.getConfig());
+        assertEquals(LinkExtractorOptionsParam.MIN_MAX_BODY_SIZE_MB, options.getMaxBodySizeMb());
+    }
+
+    @Test
+    void shouldUseHiddenHistoryTypeWhenNotRecordingInHistoryTab() {
+        assertEquals(
+                HistoryReference.TYPE_HIDDEN, LinkExtractorNetworkListener.historyTypeFor(false));
+    }
+
+    /**
+     * The body-size gate decides, on the network thread, whether a body is ever copied and decoded.
+     * A body of exactly the configured limit must still be scanned, and the limit has to be usable
+     * for the whole option range rather than only the default.
+     */
+    @Test
+    void shouldOnlySkipBodiesOverTheConfiguredLimit() {
+        long limit = LinkExtractorOptionsParam.DEFAULT_MAX_BODY_SIZE_MB * 1024L * 1024L;
+
+        assertTrue(LinkExtractorNetworkListener.isBodyWithinScanLimit(1, limit));
+        assertTrue(LinkExtractorNetworkListener.isBodyWithinScanLimit((int) limit - 1, limit));
+        assertTrue(LinkExtractorNetworkListener.isBodyWithinScanLimit((int) limit, limit));
+        assertFalse(LinkExtractorNetworkListener.isBodyWithinScanLimit((int) limit + 1, limit));
+
+        // The gate honours the whole option range, not just the default: exactly the largest
+        // supported limit is still scanned, one byte more is not.
+        long maxLimit = LinkExtractorOptionsParam.MAX_MAX_BODY_SIZE_MB * 1024L * 1024L;
+        assertTrue(LinkExtractorNetworkListener.isBodyWithinScanLimit((int) maxLimit, maxLimit));
+        assertFalse(LinkExtractorNetworkListener.isBodyWithinScanLimit((int) maxLimit + 1, maxLimit));
+    }
+
+    /**
+     * The saturation gate drops a response before the body snapshot when the parse queue is already
+     * this deep, so the depth at which it starts dropping is part of the add-on's behaviour.
+     */
+    @Test
+    void shouldDropResponsesOnceTheParseQueueIsFull() {
+        assertFalse(LinkExtractorNetworkListener.isParseQueueFull(0));
+        assertFalse(LinkExtractorNetworkListener.isParseQueueFull(15));
+        assertTrue(LinkExtractorNetworkListener.isParseQueueFull(16));
+        assertTrue(LinkExtractorNetworkListener.isParseQueueFull(17));
+        assertTrue(LinkExtractorNetworkListener.isParseQueueFull(10_000));
+    }
+
+    /**
+     * The configuration carries a version so a later release can tell which keys a config predates.
+     * A config written before the body limit existed must therefore be recognised as older and get
+     * the default limit written into it, rather than relying on a value that is only in memory.
+     */
+    @Test
+    void shouldWriteTheDefaultBodyLimitWhenMigratingAnOlderConfig() {
+        LinkExtractorOptionsParam options = createOptions();
+        options.load(new ZapXmlConfiguration());
+
+        assertEquals(3, options.getCurrentVersion());
+
+        options.updateConfigsImpl(2);
+        assertEquals(
+                LinkExtractorOptionsParam.DEFAULT_MAX_BODY_SIZE_MB,
+                options.getConfig().getInt("linkextractor.maxBodySizeMb", -1));
+    }
+
+    /**
+     * The insertion token bucket is checked before anything is persisted, so it has to actually deny
+     * once it is empty. It previously clamped an empty bucket to 0 and then tested the result
+     * against 0, so every single request was granted a token and nothing was ever rate limited.
+     */
+    @Test
+    void shouldDenyInsertionsOnceTheTokenBucketIsEmpty() {
+        LinkExtractorNetworkListener listener =
+                new LinkExtractorNetworkListener(createOptions());
+        // Shut the listener down first: the token refill scheduler would otherwise top the bucket
+        // back up (correctly) while the test is looping.
+        listener.shutdown();
+        listener.setInsertTokens(0);
+
+        for (int i = 0; i < 1000; i++) {
+            assertFalse(listener.acquireInsertToken(), "empty bucket must deny insertion " + i);
+        }
+        assertEquals(0, listener.availableInsertTokens());
+    }
+
+    @Test
+    void shouldGrantExactlyTheAvailableInsertTokens() {
+        LinkExtractorNetworkListener listener =
+                new LinkExtractorNetworkListener(createOptions());
+        listener.shutdown();
+        listener.setInsertTokens(3);
+
+        assertTrue(listener.acquireInsertToken());
+        assertTrue(listener.acquireInsertToken());
+        assertTrue(listener.acquireInsertToken());
+        assertFalse(listener.acquireInsertToken());
+        assertEquals(0, listener.availableInsertTokens());
+    }
+
+    /**
+     * The "&lt;meta ... url=" and "$.ajax({... url:" patterns used unbounded lazy runs whose
+     * terminator may be absent (an unclosed tag/brace), which makes every start offset re-scan to
+     * the end of the body: quadratic work a crafted page can trigger at will. The runs are bounded
+     * now, so such a body must be processed quickly, while the real-world forms still extract.
+     */
+    @Test
+    void shouldStayFastOnCraftedUnclosedMetaAndAjaxBodies() {
+        StringBuilder body = new StringBuilder();
+        for (int i = 0; i < 24000; i++) {
+            body.append("<meta name=x ");
+            body.append("$.ajax({xxxxxxxx");
+        }
+
+        long start = System.nanoTime();
+        Set<String> found = LinkExtractorNetworkListener.extractCandidates(body.toString());
+        long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
+
+        // The unbounded patterns need ~50s for a body of this size (measured), so the 10s budget
+        // below fails loudly if the bound is ever dropped again, while passing comfortably on a
+        // slow machine with the bound in place.
+        assertTrue(elapsedMs < 10_000, "crafted body took " + elapsedMs + "ms");
+        assertTrue(found.isEmpty(), "no real candidate in the crafted body, got: " + found);
+    }
+
+    @Test
+    void shouldStillExtractMetaRefreshAndAjaxUrls() {
+        Set<String> meta =
+                LinkExtractorNetworkListener.extractCandidates(
+                        "<meta http-equiv=\"refresh\" content=\"0;url=/login\">");
+        assertTrue(meta.contains("/login"), "meta refresh url not extracted, got: " + meta);
+
+        Set<String> ajax =
+                LinkExtractorNetworkListener.extractCandidates(
+                        "$.ajax({ url: \"/api/items\", type: \"GET\" });");
+        assertTrue(ajax.contains("/api/items"), "$.ajax url not extracted, got: " + ajax);
+    }
+
+    /**
+     * Trailing backslashes and trailing {@code >;,} are stripped from every normalised candidate.
+     * That used to be done with two {@code String.replaceAll} calls, which re-compiled both patterns
+     * for every candidate; the character-loop version must behave identically.
+     */
+    @Test
+    void shouldStripTrailingGarbageFromCandidates() {
+        Set<String> found =
+                LinkExtractorNetworkListener.extractCandidates(
+                        "body{background:url(/static/app.css;)}"
+                                + "body{background:url(/static/other.css>)}"
+                                + "body{background:url(/static/third.css,)}"
+                                + "body{background:url(/static/fourth.css\\)}");
+
+        assertTrue(found.contains("/static/app.css"), "trailing ';' not stripped, got: " + found);
+        assertTrue(found.contains("/static/other.css"), "trailing '>' not stripped, got: " + found);
+        assertTrue(found.contains("/static/third.css"), "trailing ',' not stripped, got: " + found);
+        assertTrue(found.contains("/static/fourth.css"), "trailing '\\' not stripped, got: " + found);
+    }
+
+    /**
+     * The registrable domain of the source host is constant for a whole response and is now passed
+     * into the family check pre-computed; the overload must agree with the two-argument version.
+     */
+    @Test
+    void shouldAgreeOnDomainFamilyWhenBaseRegistrableDomainIsPrecomputed() {
+        String[][] same = {
+            {"www.example.com", "api.example.com"},
+            {"example.com", "deep.sub.example.com"},
+            {"www.example.co.uk", "shop.example.co.uk"},
+            {"a.b.example.com", "example.com"},
+        };
+        for (String[] pair : same) {
+            assertTrue(
+                    LinkExtractorNetworkListener.isSameDomainFamily(pair[0], pair[1]),
+                    pair[0] + " should share a family with " + pair[1]);
+            assertTrue(
+                    LinkExtractorNetworkListener.isSameDomainFamily(
+                            pair[0], LinkExtractorNetworkListener.registrableDomain(pair[0]), pair[1]),
+                    "pre-computed registrable domain changed the result for " + pair[0] + "/" + pair[1]);
+        }
+
+        String[][] different = {
+            {"example.com", "example.org"},
+            {"example.com", "notexample.com"},
+            {"example.co.uk", "example.com"},
+        };
+        for (String[] pair : different) {
+            assertFalse(
+                    LinkExtractorNetworkListener.isSameDomainFamily(pair[0], pair[1]),
+                    pair[0] + " should not share a family with " + pair[1]);
+            assertFalse(
+                    LinkExtractorNetworkListener.isSameDomainFamily(
+                            pair[0], LinkExtractorNetworkListener.registrableDomain(pair[0]), pair[1]),
+                    "pre-computed registrable domain changed the result for " + pair[0] + "/" + pair[1]);
+        }
+    }
+
+    /**
+     * The history tab is not only fed by {@code ExtensionHistory.addHistory(...)}: it is rebuilt from
+     * the session history by {@code ExtensionHistory.getHistoryIds()}, which selects the proxied,
+     * ZAP-user and proxy-connect types. An entry of any other type can therefore never be listed,
+     * which is what makes the option hold - this test pins the type sets the add-on relies on.
+     */
+    @Test
+    void shouldOnlyUseHistoryTypesTheHistoryTabCanList() {
+        int[] historyTabTypes = {
+            HistoryReference.TYPE_PROXIED,
+            HistoryReference.TYPE_ZAP_USER,
+            HistoryReference.TYPE_PROXY_CONNECT
+        };
+
+        assertTrue(contains(historyTabTypes, LinkExtractorNetworkListener.historyTypeFor(true)));
+        assertFalse(contains(historyTabTypes, LinkExtractorNetworkListener.historyTypeFor(false)));
+    }
+
+    private static boolean contains(int[] values, int value) {
+        for (int candidate : values) {
+            if (candidate == value) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Test
