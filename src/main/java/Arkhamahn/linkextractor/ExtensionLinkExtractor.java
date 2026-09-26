@@ -67,8 +67,25 @@ public class ExtensionLinkExtractor extends ExtensionAdaptor {
 
     @Override
     public void unload() {
+        shutdownListener();
+    }
+
+    @Override
+    public void destroy() {
+        shutdownListener();
+        super.destroy();
+    }
+
+    /**
+     * Releases the listener's worker pool, token-refill scheduler and queued EDT work. Called both
+     * when the session ends and when the add-on is unloaded, so no thread or queued task outlives
+     * the session it belongs to.
+     */
+    private void shutdownListener() {
         if (networkListener != null) {
             ZAP.getEventBus().unregisterConsumer(networkListener);
+            networkListener.shutdown();
+            networkListener = null;
         }
     }
 
